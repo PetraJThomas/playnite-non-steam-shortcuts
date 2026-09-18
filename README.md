@@ -72,6 +72,13 @@ Playnite covers are usually already 600x900 — the shape SteamGridDB serves —
 if you use the SteamGridDB metadata plugin in Playnite, that art carries straight
 through to Steam.
 
+Nothing is invented when a game has no cover. Steam falls back to its own plain
+name tile, which looks better than a small package icon stretched to portrait
+shape. The results dialog lists any game that ended up without library
+artwork, so you can give it a cover in Playnite (Download Metadata, or a
+SteamGridDB metadata addon) and then run "replace Steam artwork" to push it
+across.
+
 Playnite **categories** are written to the shortcut's `tags`, so they show up as
 Steam tags.
 
