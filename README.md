@@ -49,6 +49,12 @@ sees Steam running.
 Select some games, then "Extensions" → "Non-Steam Shortcuts" →
 "Create non-Steam shortcuts". Start Steam again afterwards.
 
+A progress window shows which game is being handled and how far through the
+selection it is, and can be cancelled. Cancelling stops before anything is
+written, so `shortcuts.vdf` is left exactly as it was. This matters most with
+the SteamGridDB fallback switched on, since looking a game up is a network round
+trip and a large selection would otherwise sit there looking frozen.
+
 Two menu entries are available:
 
 *   **Create non-Steam shortcuts** — creates/updates the shortcuts and fills in
