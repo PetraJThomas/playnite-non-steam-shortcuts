@@ -33,6 +33,7 @@ $script:LaunchWithoutSteamName = 'Launch without Steam'
 $script:SteamActionName        = 'Non-Steam Steam Shortcut'
 $script:SteamPluginId          = [Guid]::Parse('CB91DFC9-B977-43BF-8E70-55F46E410FAB')
 $script:RunGameIdPrefix        = 'steam://rungameid/'
+$script:OwnerPrefix            = 'playnite:'
 $script:BackupsToKeep          = 10
 
 # Copy these Playnite media fields into Steam's grid folder.
@@ -62,7 +63,12 @@ function GetGameMenuItems
     $replace.FunctionName = 'Add-NonSteamShortcutsReplacingArt'
     $replace.MenuSection  = '@Non-Steam Shortcuts'
 
-    return @($create, $replace)
+    $rebuild = New-Object Playnite.SDK.Plugins.ScriptGameMenuItem
+    $rebuild.Description  = 'Replace ALL non-Steam shortcuts with the selected games'
+    $rebuild.FunctionName = 'Reset-NonSteamShortcuts'
+    $rebuild.MenuSection  = '@Non-Steam Shortcuts'
+
+    return @($create, $replace, $rebuild)
 }
 
 function GetMainMenuItems
@@ -79,7 +85,12 @@ function GetMainMenuItems
     $gridKey.FunctionName = 'Set-SteamGridDbApiKey'
     $gridKey.MenuSection  = '@Non-Steam Shortcuts'
 
-    return @($steamFolder, $gridKey)
+    $sync = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
+    $sync.Description  = 'Remove shortcuts for games deleted from Playnite'
+    $sync.FunctionName = 'Sync-NonSteamShortcuts'
+    $sync.MenuSection  = '@Non-Steam Shortcuts'
+
+    return @($steamFolder, $gridKey, $sync)
 }
 
 
@@ -1416,6 +1427,322 @@ function Copy-SteamGridArt
 
 
 ###############################################################################
+# Ownership and sync
+#
+# A shortcut is "ours" if either of two things says so:
+#
+#   1. A record we keep ourselves, in owned_shortcuts.json under the extension's
+#      data folder, mapping Steam app id -> Playnite game id. Steam cannot touch
+#      this, so it is the authority.
+#
+#   2. A stamp in the shortcut's devkitgameid field, "playnite:<game id>". That
+#      field is part of Steam's own shortcut schema and is meaningless for an
+#      ordinary non-Steam shortcut, so it is a reasonable place to put it, and
+#      it travels with the entry if the record is ever lost.
+#
+# Two signals rather than one because it is NOT established that Steam preserves
+# a value written to devkitgameid when it rewrites shortcuts.vdf. If it strips
+# it, the record still identifies our entries; if the record is lost, the stamp
+# still does. Either one alone is enough to claim an entry.
+#
+# Nothing matched by neither is ever touched. Shortcuts added by hand, or by
+# another tool, are not ours to remove.
+###############################################################################
+
+function Get-OwnedShortcutsPath
+{
+    if (-not (Test-Path -LiteralPath $CurrentExtensionDataPath -PathType Container)) {
+        New-Item -ItemType Directory -Path $CurrentExtensionDataPath -Force | Out-Null
+    }
+    return (Join-Path $CurrentExtensionDataPath 'owned_shortcuts.json')
+}
+
+function Get-OwnedShortcuts
+{
+    # appid (as a string) -> Playnite game id
+    $path = Get-OwnedShortcutsPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{} }
+
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+        $owned = @{}
+        foreach ($property in (ConvertFrom-Json $raw).PSObject.Properties) {
+            $owned[$property.Name] = [string]$property.Value
+        }
+        return $owned
+    } catch {
+        $__logger.Warn("Non-Steam: could not read the owned shortcut record: $($_.Exception.Message)")
+        return @{}
+    }
+}
+
+function Save-OwnedShortcuts
+{
+    param($Owned)
+
+    try {
+        ($Owned | ConvertTo-Json -Depth 3) | Set-Content -LiteralPath (Get-OwnedShortcutsPath) -Encoding UTF8
+    } catch {
+        $__logger.Warn("Non-Steam: could not save the owned shortcut record: $($_.Exception.Message)")
+    }
+}
+
+function Register-OwnedShortcut
+{
+    param([long]$AppId, [string]$GameId)
+
+    $owned = Get-OwnedShortcuts
+    $owned["$AppId"] = $GameId
+    Save-OwnedShortcuts $owned
+}
+
+function Get-ShortcutOwnerId
+{
+    <#
+        The Playnite game id behind a shortcut, from our own record or from the
+        devkitgameid stamp, or $null if the shortcut is not ours.
+    #>
+    param($Shortcut, $Owned)
+
+    if (-not $Shortcut) { return $null }
+
+    # Our own record first: Steam cannot have interfered with it.
+    if ($Owned -and $Shortcut.Contains('appid')) {
+        $appId = ConvertTo-UnsignedAppId ([long]$Shortcut['appid'])
+        if ($Owned.ContainsKey("$appId")) { return $Owned["$appId"] }
+    }
+
+    # Then the stamp, which may or may not have survived Steam.
+    if ($Shortcut.Contains('devkitgameid')) {
+        $value = [string]$Shortcut['devkitgameid']
+        if (-not [string]::IsNullOrWhiteSpace($value) -and
+            $value.StartsWith($script:OwnerPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $id = $value.Substring($script:OwnerPrefix.Length).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($id)) { return $id }
+        }
+    }
+    return $null
+}
+
+function Test-PlayniteGameExists
+{
+    param([string]$GameId)
+
+    try {
+        $guid = [Guid]::Parse($GameId)
+    } catch {
+        return $false
+    }
+    try {
+        return ($null -ne $PlayniteApi.Database.Games.Get($guid))
+    } catch {
+        # If the database cannot answer, assume the game is there. Deleting a
+        # shortcut is not worth a guess.
+        $__logger.Warn("Non-Steam: could not look up game $GameId : $($_.Exception.Message)")
+        return $true
+    }
+}
+
+function Remove-SteamGridArt
+{
+    <#
+        Delete the grid files belonging to one app id. Matched precisely rather
+        than with "<appid>*", which would also hit an app id that merely starts
+        with the same digits.
+    #>
+    param([string]$GridDir, [long]$AppId)
+
+    if (-not (Test-Path -LiteralPath $GridDir -PathType Container)) { return 0 }
+
+    $pattern = '^' + [regex]::Escape("$AppId") + '(p|_[A-Za-z]+)?\.[A-Za-z0-9]+$'
+    $removed = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $GridDir -File -ErrorAction SilentlyContinue)) {
+        if ($file.Name -match $pattern) {
+            try {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                $removed++
+            } catch {
+                $__logger.Warn("Non-Steam: could not delete $($file.Name): $($_.Exception.Message)")
+            }
+        }
+    }
+    return $removed
+}
+
+function Sync-NonSteamShortcuts
+{
+    <#
+        Remove shortcuts this extension created for games that are no longer in
+        the Playnite library.
+    #>
+    param($scriptMainMenuItemActionArgs)
+
+    $steamUserdata = Get-SelectedSteamUserdataFolder
+    if (-not (Test-SteamUserdataDir $steamUserdata)) { return }
+
+    $shortcutsVdf = Join-Path $steamUserdata 'config\shortcuts.vdf'
+    $gridDir      = Join-Path $steamUserdata 'config\grid'
+
+    if (-not (Test-Path -LiteralPath $shortcutsVdf -PathType Leaf)) {
+        [void]$PlayniteApi.Dialogs.ShowMessage('There is no shortcuts.vdf to sync yet.', 'Non-Steam Shortcuts')
+        return
+    }
+
+    try {
+        $entries = Read-ShortcutsVdf $shortcutsVdf
+    } catch {
+        [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error loading shortcuts.vdf')
+        return
+    }
+
+    $owned   = Get-OwnedShortcuts
+    $keep    = New-Object 'System.Collections.Generic.List[object]'
+    $stale   = New-Object 'System.Collections.Generic.List[object]'
+    $ourEntries = 0
+    $foreign    = 0
+
+    foreach ($entry in $entries) {
+        $ownerId = Get-ShortcutOwnerId $entry $owned
+        if ($null -eq $ownerId) {
+            # Not ours. Keep it, always.
+            $foreign++
+            $keep.Add($entry)
+            continue
+        }
+        $ourEntries++
+        if (Test-PlayniteGameExists $ownerId) {
+            $keep.Add($entry)
+        } else {
+            $__logger.Info("Non-Steam: '$($entry['appname'])' is no longer in Playnite")
+            $stale.Add($entry)
+        }
+    }
+
+    $nl = [Environment]::NewLine
+
+    if ($stale.Count -eq 0) {
+        $message  = 'Nothing to clean up.' + $nl + $nl
+        $message += "Checked $ourEntries shortcut(s) created by this extension; every one still has a game in Playnite."
+        if ($foreign -gt 0) {
+            $message += $nl + $nl + "$foreign other shortcut(s) in Steam were left alone, because this extension did not create them."
+        }
+        if ($ourEntries -eq 0) {
+            $message += $nl + $nl + 'Shortcuts created before this version are not stamped as ours yet. Run '
+            $message += '"Create non-Steam shortcuts" over those games once and they will be picked up from then on.'
+        }
+        [void]$PlayniteApi.Dialogs.ShowMessage($message, 'Non-Steam Shortcuts')
+        return
+    }
+
+    $names = @($stale | ForEach-Object { $_['appname'] })
+    $shown = $names
+    if ($shown.Count -gt 15) { $shown = $shown[0..14] + "[... and $($names.Count - 15) more]" }
+
+    $message  = "$($stale.Count) Steam shortcut(s) no longer have a game in Playnite." + $nl + $nl
+    $message += 'Remove them from Steam, along with their artwork?' + $nl + $nl
+    $message += ($shown -join $nl)
+    if ($foreign -gt 0) {
+        $message += $nl + $nl + "$foreign shortcut(s) not created by this extension will be left alone."
+    }
+
+    $answer = $PlayniteApi.Dialogs.ShowMessage(
+        $message, 'Non-Steam Shortcuts',
+        [System.Windows.MessageBoxButton]::YesNo,
+        [System.Windows.MessageBoxImage]::Warning)
+    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+    if (Get-Process -Name 'steam' -ErrorAction SilentlyContinue) {
+        $running = $PlayniteApi.Dialogs.ShowMessage(
+            'Steam is running and will rewrite shortcuts.vdf when it exits, undoing this. Continue anyway?',
+            'Non-Steam Shortcuts',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning)
+        if ($running -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    }
+
+    try {
+        [void](Backup-ShortcutsVdf $shortcutsVdf)
+    } catch {
+        [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error backing up shortcuts.vdf')
+        return
+    }
+
+    $artRemoved = 0
+    foreach ($entry in $stale) {
+        if ($entry.Contains('appid')) {
+            $appId = ConvertTo-UnsignedAppId ([long]$entry['appid'])
+            $artRemoved += Remove-SteamGridArt $gridDir $appId
+        }
+    }
+
+    try {
+        Write-ShortcutsVdf $shortcutsVdf $keep
+    } catch {
+        [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error saving shortcuts.vdf')
+        return
+    }
+
+    # Drop the removed entries from our record too.
+    foreach ($entry in $stale) {
+        if ($entry.Contains('appid')) {
+            $appId = ConvertTo-UnsignedAppId ([long]$entry['appid'])
+            if ($owned.ContainsKey("$appId")) { $owned.Remove("$appId") }
+        }
+    }
+    Save-OwnedShortcuts $owned
+
+    $result  = "Removed $($stale.Count) shortcut(s) and $artRemoved artwork file(s)." + $nl + $nl
+    $result += "$($keep.Count) shortcut(s) left in Steam."
+    $result += $nl + $nl + 'Relaunch Steam to see the change.'
+    [void]$PlayniteApi.Dialogs.ShowMessage($result, 'Non-Steam Shortcuts')
+}
+
+function Confirm-ReplaceAllShortcuts
+{
+    <#
+        The destructive path, so it says plainly what will be lost and defaults
+        to cancelling.
+    #>
+    param([string]$ShortcutsVdf, [int]$SelectedCount)
+
+    $existing = 0
+    try {
+        $existing = (Read-ShortcutsVdf $ShortcutsVdf).Count
+    } catch {
+        $existing = 0
+    }
+
+    $nl = [Environment]::NewLine
+    $message  = 'This will completely rewrite and overwrite your existing non-Steam shortcuts '
+    $message += 'for your Steam account.' + $nl + $nl
+    $message += "Steam currently has $existing non-Steam shortcut(s). All of them will be removed "
+    $message += "and replaced with the $SelectedCount game(s) you have selected in Playnite." + $nl + $nl
+    $message += 'If you have added shortcuts by hand, or with another tool such as EmuDeck or '
+    $message += 'Steam ROM Manager, or changed any launch options or artwork outside Playnite, '
+    $message += 'those changes will be lost.' + $nl + $nl
+    $message += 'A timestamped backup of shortcuts.vdf has already been written next to it, so '
+    $message += 'this can be undone by restoring that file.' + $nl + $nl
+    $message += 'Continue?'
+
+    $no  = New-Object Playnite.SDK.MessageBoxOption('No, leave my shortcuts alone', $true, $true)
+    $yes = New-Object Playnite.SDK.MessageBoxOption('Yes, replace everything', $false, $false)
+    $options = New-Object 'System.Collections.Generic.List[Playnite.SDK.MessageBoxOption]'
+    $options.Add($no)
+    $options.Add($yes)
+
+    $chosen = $PlayniteApi.Dialogs.ShowMessage(
+        $message, 'Non-Steam Shortcuts - replace everything',
+        [System.Windows.MessageBoxImage]::Warning, $options)
+
+    if ($null -eq $chosen -or $chosen.IsCancel -or $chosen.Title -ne $yes.Title) {
+        $__logger.Info('Non-Steam: replace-everything cancelled')
+        return $false
+    }
+    return $true
+}
+
+###############################################################################
 # Main entry point
 ###############################################################################
 
@@ -1431,6 +1758,21 @@ function Add-NonSteamShortcutsReplacingArt
     param($scriptGameMenuItemActionArgs)
 
     Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt
+}
+
+function Reset-NonSteamShortcuts
+{
+    <#
+        Throw away every non-Steam shortcut and rebuild the list from the games
+        selected in Playnite.
+
+        This is the blunt alternative to the sync: it needs no way of telling
+        which shortcuts are ours, because it keeps none of them. Select the
+        games you want in Steam, confirm, and Steam ends up with exactly those.
+    #>
+    param($scriptGameMenuItemActionArgs)
+
+    Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt -ReplaceAll
 }
 
 function Invoke-ShortcutBuild
@@ -1576,6 +1918,9 @@ function Invoke-ShortcutBuild
             'startdir'      = $quotedStartDir
             'icon'          = $icon
             'launchoptions' = $launch.Arguments
+            # Marks the entry as ours, and carries the Playnite game id so a
+            # later sync can tell whether the game still exists.
+            'devkitgameid'  = "$($script:OwnerPrefix)$($game.Id)"
         }
 
         if ($existing) {
@@ -1592,6 +1937,9 @@ function Invoke-ShortcutBuild
         }
 
         $shortcut['tags'] = Merge-SteamTags $shortcut $game
+
+        # Our own record of what we own, which Steam cannot alter.
+        Register-OwnedShortcut $appId ([string]$game.Id)
 
         $artCopied += Copy-SteamGridArt $GridDir $appId $game -Overwrite:$ReplaceArt
 
@@ -1642,7 +1990,7 @@ function Invoke-ShortcutBuild
 
 function Invoke-NonSteamShortcuts
 {
-    param($scriptGameMenuItemActionArgs, [switch]$ReplaceArt)
+    param($scriptGameMenuItemActionArgs, [switch]$ReplaceArt, [switch]$ReplaceAll)
 
     $games = $scriptGameMenuItemActionArgs.Games
     if (-not $games -or $games.Count -eq 0) {
@@ -1682,11 +2030,21 @@ function Invoke-NonSteamShortcuts
             [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error backing up shortcuts.vdf')
             return
         }
-        try {
-            $steamShortcuts = Read-ShortcutsVdf $shortcutsVdf
-        } catch {
-            [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error loading shortcuts.vdf')
-            return
+
+        if ($ReplaceAll) {
+            if (-not (Confirm-ReplaceAllShortcuts $shortcutsVdf $games.Count)) { return }
+            # Deliberately do NOT read the existing file: the whole point is to
+            # discard it and rebuild the list from the selection.
+            $steamShortcuts = New-Object 'System.Collections.Generic.List[object]'
+            $__logger.Warn("Non-Steam: replacing every non-Steam shortcut with $($games.Count) selected game(s)")
+        }
+        else {
+            try {
+                $steamShortcuts = Read-ShortcutsVdf $shortcutsVdf
+            } catch {
+                [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error loading shortcuts.vdf')
+                return
+            }
         }
     } else {
         $steamShortcuts = New-Object 'System.Collections.Generic.List[object]'

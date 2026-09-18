@@ -94,13 +94,15 @@ Select one or more games in Playnite, right-click, then **Non-Steam Shortcuts**:
 | ---------- | ------------ |
 | **Create non-Steam shortcuts** | Creates or updates the shortcuts. Fills any artwork slot that is currently empty, leaving existing Steam artwork alone. |
 | **Create non-Steam shortcuts (replace Steam artwork)** | The same, but always refreshes the Steam-side artwork from Playnite and SteamGridDB. |
+| **Replace ALL non-Steam shortcuts with the selected games** | Destructive. See [Keeping Steam in sync](#keeping-steam-in-sync). |
 
-Under **Extensions → Non-Steam Shortcuts** (the main menu) there are two more:
+Under **Extensions → Non-Steam Shortcuts** (the main menu) there are three more:
 
 | Menu entry | What it does |
 | ---------- | ------------ |
 | **Find Steam Install Folder** | Choose which Steam profile to write to. |
 | **Set SteamGridDB API key...** | Set or clear the key used for fallback artwork. |
+| **Remove shortcuts for games deleted from Playnite** | Tidies up shortcuts whose game is gone. |
 
 A progress window shows which game is being handled and how far through the
 selection it is, and can be cancelled. Cancelling stops before anything is
@@ -115,6 +117,48 @@ The game's play action becomes a `steam://rungameid/...` URL, and the original
 action is kept alongside it, renamed **"Launch without Steam"**. So you can still
 launch it directly from Playnite, and rerunning the extension picks that action
 back up rather than pointing the shortcut at itself.
+
+## Keeping Steam in sync
+
+Delete a game from Playnite and its Steam shortcut stays behind, pointing at
+nothing. There are two ways to clear those out.
+
+### Remove shortcuts for games deleted from Playnite
+
+The careful one. It removes only shortcuts this extension created, whose Playnite
+game no longer exists, and asks before touching anything.
+
+A shortcut counts as ours if either of two things says so:
+
+*   a record kept in `owned_shortcuts.json` in the extension's data folder,
+    mapping Steam app id to Playnite game id, which Steam cannot alter;
+*   a `playnite:<game id>` stamp in the shortcut's `devkitgameid` field, which is
+    part of Steam's own shortcut schema and meaningless for an ordinary shortcut.
+
+Two signals rather than one because it is **not established** that Steam
+preserves a value written to `devkitgameid` when it rewrites `shortcuts.vdf`. If
+it strips it, the record still identifies our entries; if the record is lost, the
+stamp still does.
+
+Anything matched by neither is never touched, so shortcuts you added by hand or
+with EmuDeck or Steam ROM Manager are safe.
+
+> Shortcuts created before this feature existed are not marked as ours. Run
+> "Create non-Steam shortcuts" over those games once and they will be picked up
+> from then on.
+
+### Replace ALL non-Steam shortcuts with the selected games
+
+The blunt one, for when you would rather not depend on any of the above. It
+throws away **every** non-Steam shortcut and rebuilds the list from the games you
+have selected, so Steam ends up with exactly those and nothing else.
+
+It needs no way of telling which shortcuts are ours, because it keeps none of
+them. That is also why it is destructive: anything you added by hand or with
+another tool goes too, along with launch options and artwork changed outside
+Playnite. It says so, counts what will be lost, and defaults to cancelling.
+
+`shortcuts.vdf` is backed up first, so restoring that file undoes it.
 
 ## Artwork and metadata
 
