@@ -1211,6 +1211,7 @@ function Invoke-NonSteamShortcuts
     $skippedUnresolvable = New-Object 'System.Collections.Generic.List[string]'
     $skippedNotInstalled = New-Object 'System.Collections.Generic.List[string]'
     $noOverlayGames      = New-Object 'System.Collections.Generic.List[string]'
+    $noArtworkGames      = New-Object 'System.Collections.Generic.List[string]'
     $skippedDuplicate    = New-Object 'System.Collections.Generic.List[string]'
     $urlGames            = New-Object 'System.Collections.Generic.List[string]'
     $gamesToUpdate       = New-Object 'System.Collections.Generic.List[object]'
@@ -1339,6 +1340,15 @@ function Invoke-NonSteamShortcuts
 
         $artCopied += Copy-SteamGridArt $gridDir $appId $game -Overwrite:$ReplaceArt
 
+        # Steam falls back to a plain name tile when there is no library
+        # capsule. That is usually because Playnite has no cover for the
+        # game, which is worth saying rather than leaving to be noticed.
+        $portrait = @(Get-ChildItem -LiteralPath $gridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
+        if ($portrait.Count -eq 0) {
+            $__logger.Info("Non-Steam: no library artwork for $($game.Name); Playnite has no cover to copy")
+            $noArtworkGames.Add($game.Name)
+        }
+
         # Remember the Playnite-side rewrite, applied only once the vdf is saved.
         $gamesToUpdate.Add([pscustomobject]@{
             Game         = $game
@@ -1352,7 +1362,7 @@ function Invoke-NonSteamShortcuts
         Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
             -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
             -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -UrlGames $urlGames -NothingWritten
+            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -UrlGames $urlGames -NothingWritten
         return
     }
 
@@ -1428,7 +1438,7 @@ function Invoke-NonSteamShortcuts
     Show-ResultMessage -GamesNew $gamesNew -GamesUpdated $gamesUpdated -ArtCopied $artCopied `
         -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
         -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -UrlGames $urlGames
+            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -UrlGames $urlGames
 }
 
 function Show-ResultMessage
@@ -1443,6 +1453,7 @@ function Show-ResultMessage
         $SkippedDuplicate,
         $SkippedNotInstalled,
         $NoOverlayGames,
+        $NoArtworkGames,
         $UrlGames,
         [switch]$NothingWritten
     )
@@ -1493,6 +1504,13 @@ function Show-ResultMessage
         $message += $nl + $nl + "Skipped $($SkippedUnresolvable.Count) game(s) whose launch command could not be resolved (bad emulator profile, or a script action):" + $nl
         $message += Format-GameList $SkippedUnresolvable
         $errors = $true
+    }
+    if ($NoArtworkGames.Count -gt 0) {
+        $message += $nl + $nl + "$($NoArtworkGames.Count) game(s) have no library artwork in Steam, because Playnite"
+        $message += ' has no cover image for them. Steam shows a plain name tile instead. Give them a cover in'
+        $message += ' Playnite (Download Metadata, or a SteamGridDB metadata addon) and run the "replace Steam'
+        $message += ' artwork" menu entry to push it across:' + $nl
+        $message += Format-GameList $NoArtworkGames
     }
     if ($NoOverlayGames.Count -gt 0) {
         $message += $nl + $nl + "$($NoOverlayGames.Count) of these are packaged Microsoft Store apps,"
