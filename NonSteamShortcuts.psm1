@@ -543,6 +543,86 @@ function Get-SourcePlayAction
     return $candidates[0]
 }
 
+function Resolve-MicrosoftStoreLaunch
+{
+    <#
+        Microsoft Store / Xbox Game Pass games.
+
+        The Xbox library plugin hands Playnite its own XboxPlayController rather
+        than an AutomaticPlayController, so GetPlayActions yields no command
+        line. It activates the package via
+        "explorer.exe shell:AppsFolder\<PackageFamilyName>!<AppId>", reading the
+        AppId out of the package's AppxManifest.xml. We reconstruct the same
+        thing here.
+
+        Most Game Pass PC titles declare EntryPoint="Windows.FullTrustApplication",
+        i.e. they are ordinary Win32 games in WindowsApps with a real .exe. For
+        those we target the executable directly, which keeps Steam attached to
+        the process so the overlay works. Genuine sandboxed UWP apps fall back to
+        shell activation, which launches but cannot carry the overlay.
+    #>
+    param($Game)
+
+    $pfn = $Game.GameId
+    if ([string]::IsNullOrWhiteSpace($pfn) -or $pfn -notmatch '^[A-Za-z0-9.\-]+_[a-z0-9]{13}$') {
+        return $null
+    }
+
+    # Playnite usually records the package folder; otherwise ask Windows.
+    $installDir = $Game.InstallDirectory
+    if ([string]::IsNullOrWhiteSpace($installDir) -or -not (Test-Path -LiteralPath $installDir -PathType Container)) {
+        try {
+            $package = Get-AppxPackage -ErrorAction Stop | Where-Object { $_.PackageFamilyName -eq $pfn } | Select-Object -First 1
+            if ($package) { $installDir = $package.InstallLocation }
+        } catch {
+            $__logger.Warn("Non-Steam: could not query the app package for $($Game.Name): $($_.Exception.Message)")
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($installDir)) { return $null }
+
+    $appId      = 'App'
+    $executable = $null
+    $fullTrust  = $false
+    try {
+        $manifest = [xml](Get-Content -LiteralPath (Join-Path $installDir 'AppxManifest.xml') -Raw -ErrorAction Stop)
+        $app = @($manifest.Package.Applications.Application)[0]
+        if ($app) {
+            if ($app.Id)         { $appId      = $app.Id }
+            if ($app.Executable) { $executable = $app.Executable }
+            $fullTrust = ($app.EntryPoint -eq 'Windows.FullTrustApplication')
+        }
+    } catch {
+        $__logger.Warn("Non-Steam: could not read AppxManifest.xml for $($Game.Name): $($_.Exception.Message)")
+    }
+
+    if ($fullTrust -and $executable) {
+        $exePath = Join-Path $installDir $executable
+        if (Test-Path -LiteralPath $exePath -PathType Leaf) {
+            $__logger.Info("Non-Steam: resolved Microsoft Store game $($Game.Name) to its Win32 executable: $exePath")
+            return @{
+                Exe        = $exePath
+                Arguments  = ''
+                WorkingDir = $installDir
+                IsUrl      = $false
+            }
+        }
+        $__logger.Warn("Non-Steam: manifest executable not readable for $($Game.Name): $exePath")
+    }
+
+    # Sandboxed UWP, or the executable could not be reached: shell-activate it
+    # the same way the Xbox plugin does. Steam will launch it, but explorer.exe
+    # exits immediately so the overlay cannot attach.
+    $shell = "shell:AppsFolder\$pfn!$appId"
+    $__logger.Info("Non-Steam: falling back to shell activation for $($Game.Name): $shell")
+    return @{
+        Exe        = (Join-Path $env:WINDIR 'explorer.exe')
+        Arguments  = $shell
+        WorkingDir = $env:WINDIR
+        IsUrl      = $false
+        NoOverlay  = $true
+    }
+}
+
 function Resolve-LibraryPluginLaunch
 {
     <#
@@ -973,6 +1053,7 @@ function Invoke-NonSteamShortcuts
     $skippedSteamNative  = New-Object 'System.Collections.Generic.List[string]'
     $skippedUnresolvable = New-Object 'System.Collections.Generic.List[string]'
     $skippedNotInstalled = New-Object 'System.Collections.Generic.List[string]'
+    $noOverlayGames      = New-Object 'System.Collections.Generic.List[string]'
     $skippedDuplicate    = New-Object 'System.Collections.Generic.List[string]'
     $urlGames            = New-Object 'System.Collections.Generic.List[string]'
     $gamesToUpdate       = New-Object 'System.Collections.Generic.List[object]'
@@ -1001,7 +1082,14 @@ function Invoke-NonSteamShortcuts
         } else {
             # No stored action. Library plugins supply theirs at launch time,
             # so ask the owning plugin rather than skipping the game.
-            $launch = Complete-LaunchSpec $game (Resolve-LibraryPluginLaunch $game)
+            $raw = Resolve-LibraryPluginLaunch $game
+            if (-not $raw) {
+                # Some plugins (notably Xbox) use their own PlayController and
+                # expose no command line at all, so rebuild it ourselves.
+                $raw = Resolve-MicrosoftStoreLaunch $game
+            }
+            $launch = Complete-LaunchSpec $game $raw
+            if ($launch -and $raw.NoOverlay) { $launch.NoOverlay = $true }
         }
 
         if (-not $launch) {
@@ -1021,6 +1109,10 @@ function Invoke-NonSteamShortcuts
         if ($launch.IsUrl) {
             $__logger.Warn("Non-Steam: game launches via URL, Steam overlay will not work: $($game.Name)")
             $urlGames.Add($game.Name)
+        }
+        if ($launch.NoOverlay) {
+            $__logger.Warn("Non-Steam: game is shell-activated, Steam overlay will not attach: $($game.Name)")
+            $noOverlayGames.Add($game.Name)
         }
 
         $icon = ''
@@ -1086,7 +1178,7 @@ function Invoke-NonSteamShortcuts
         Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
             -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
             -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -UrlGames $urlGames -NothingWritten
+            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -UrlGames $urlGames -NothingWritten
         return
     }
 
@@ -1162,7 +1254,7 @@ function Invoke-NonSteamShortcuts
     Show-ResultMessage -GamesNew $gamesNew -GamesUpdated $gamesUpdated -ArtCopied $artCopied `
         -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
         -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -UrlGames $urlGames
+            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -UrlGames $urlGames
 }
 
 function Show-ResultMessage
@@ -1176,6 +1268,7 @@ function Show-ResultMessage
         $SkippedUnresolvable,
         $SkippedDuplicate,
         $SkippedNotInstalled,
+        $NoOverlayGames,
         $UrlGames,
         [switch]$NothingWritten
     )
@@ -1218,14 +1311,18 @@ function Show-ResultMessage
     if ($SkippedNoAction.Count -gt 0) {
         $message += $nl + $nl + "Skipped $($SkippedNoAction.Count) game(s) with no play action, whose library plugin also supplied none:" + $nl
         $message += Format-GameList $SkippedNoAction
-        $message += $nl + $nl + 'Microsoft Store / Xbox Game Pass titles usually land here. They are launched '
-        $message += 'through the Store rather than by a command line, and being sandboxed UWP apps the Steam '
-        $message += 'overlay cannot attach to them anyway. The log records what each plugin returned.'
+        $message += $nl + $nl + 'The log records what each library plugin returned for these.'
         $errors = $true
     }
     if ($SkippedUnresolvable.Count -gt 0) {
         $message += $nl + $nl + "Skipped $($SkippedUnresolvable.Count) game(s) whose launch command could not be resolved (bad emulator profile, or a script action):" + $nl
         $message += Format-GameList $SkippedUnresolvable
+        $errors = $true
+    }
+    if ($NoOverlayGames.Count -gt 0) {
+        $message += $nl + $nl + "Created $($NoOverlayGames.Count) shortcut(s) that launch through the Microsoft Store."
+        $message += ' Steam will start them, but because they are shell-activated the overlay will not attach:' + $nl
+        $message += Format-GameList $NoOverlayGames
         $errors = $true
     }
     if ($UrlGames.Count -gt 0) {
