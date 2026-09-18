@@ -32,10 +32,12 @@ The port also tracks the Playnite 9 data model changes:
    `extension.yaml` and `NonSteamShortcuts.psm1`.
 2. Restart Playnite, or use "Tools" → "Reload Scripts".
 
-There is nothing to edit by hand. The extension finds your Steam `userdata`
-folder from the registry on first run; if you have more than one Steam account
-on the machine it asks which to use. You can change it later with
-"Extensions" → "Non-Steam Shortcuts" → "Set Steam userdata folder...".
+There is nothing to edit by hand. The extension finds your Steam install from
+the registry on first run and locates the profile inside it; if more than one
+Steam account is present it asks which to use, listing them by account name. You
+can change it later with "Extensions" -> "Non-Steam Shortcuts" ->
+"Find Steam Install Folder", where you can pick either the Steam install folder
+or a specific `userdata\<id>` folder.
 
 ## Usage
 
@@ -78,15 +80,33 @@ Steam tags.
     `crc32(Exe + AppName) | 0x80000000` id. An existing shortcut keeps whatever
     `appid` it already had, because Steam names grid artwork after that field —
     replacing it would orphan the art already on disk.
-*   **Games launched by a library plugin** (Epic, GOG, Xbox, etc.) often have no
-    concrete play action stored in Playnite, or only a URL. Those are reported as
-    skipped, or created with a warning that the overlay will not attach. Give
-    them a direct file action and rerun if you want overlay support.
+*   **Games launched by a library plugin** (Epic, GOG, Ubisoft, etc.) store no
+    play action in Playnite; the plugin supplies one at launch time. The
+    extension asks the owning plugin for it, so these work without you having to
+    set anything up. If a plugin hands back a URL rather than an executable the
+    shortcut is still created, but Steam cannot attach the overlay to it.
+
+*   **Microsoft Store / Xbox Game Pass games** are handled specially, because
+    the Xbox plugin uses its own play controller and exposes no command line at
+    all. The package's `AppxManifest.xml` is read instead:
+
+    *   Titles declaring `Windows.FullTrustApplication` are ordinary Win32 games
+        in a package, so the shortcut targets the executable directly and the
+        overlay works. Most Game Pass PC games are in this group.
+    *   Genuine UWP apps cannot be started by running their executable, so those
+        fall back to `explorer.exe shell:AppsFolder\<package>!<app>`. They launch,
+        but the overlay cannot attach and they are reported separately.
+
+*   **Games must be installed.** A shortcut is a path to an executable, and
+    until a game is installed there is nothing to point at. The resolved target
+    is verified before anything is written, so an uninstalled game with a stale
+    action cannot produce a dead shortcut.
 *   **Emulators.** Both custom and built-in emulator profiles are supported.
     Built-in profiles that launch via a Playnite startup script have no fixed
     command line and are skipped.
-*   `shortcuts.vdf` is backed up to `shortcuts.vdf.bak` before every run, and is
-    written via a temporary file so an error cannot leave a truncated file
+*   `shortcuts.vdf` is backed up before every run to a timestamped
+    `shortcuts.vdf.<yyyyMMdd-HHmmss>.bak` (the ten most recent are kept), and is
+    swapped in via a temporary file so an error cannot leave a truncated file
     behind.
 
 ## Sources used for shortcut.vdf reverse engineering
