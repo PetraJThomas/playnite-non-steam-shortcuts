@@ -1,6 +1,6 @@
 Id: bburky-playnite-non-steam-shortcuts
 Name: Non-Steam Shortcuts
 Author: Blake Burkhart
-Version: 0.2.0
-Module: nonsteam.py
+Version: 0.3.0
+Module: NonSteamShortcuts.psm1
 Type: Script
