@@ -1057,12 +1057,73 @@ $script:SgdbKeyLoaded = $false
 $script:SgdbKey       = $null
 $script:SgdbGameIds   = $null   # name -> game id, cached per run
 
+# The key is stored with DPAPI, so the file is tied to this Windows account on
+# this machine and is useless if copied elsewhere. It is not a vault: anything
+# already running as you can simply ask DPAPI to decrypt it too. The point is
+# that the key is not sitting in a text file to be read over your shoulder,
+# synced, backed up or committed by accident.
+$script:SgdbEntropy = [System.Text.Encoding]::UTF8.GetBytes('NonSteamShortcuts.SteamGridDB.v1')
+
 function Get-SteamGridDbKeyPath
 {
     if (-not (Test-Path -LiteralPath $CurrentExtensionDataPath -PathType Container)) {
         New-Item -ItemType Directory -Path $CurrentExtensionDataPath -Force | Out-Null
     }
+    return (Join-Path $CurrentExtensionDataPath 'steamgriddb_api_key.dat')
+}
+
+function Get-SteamGridDbLegacyKeyPath
+{
+    # Plaintext file written by earlier versions, migrated on first read.
     return (Join-Path $CurrentExtensionDataPath 'steamgriddb_api_key.txt')
+}
+
+function Protect-SteamGridDbKey
+{
+    param([string]$Key)
+
+    Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+    $bytes     = [System.Text.Encoding]::UTF8.GetBytes($Key)
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect(
+        $bytes, $script:SgdbEntropy, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Convert]::ToBase64String($protected)
+}
+
+function Unprotect-SteamGridDbKey
+{
+    param([string]$Encoded)
+
+    try {
+        Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+        $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            [Convert]::FromBase64String($Encoded), $script:SgdbEntropy,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        return [System.Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        # Wrong user, wrong machine, or a corrupted file.
+        $__logger.Warn("Non-Steam: the stored SteamGridDB key could not be decrypted: $($_.Exception.Message)")
+        return $null
+    }
+}
+
+function Save-SteamGridDbApiKey
+{
+    param([string]$Key)
+
+    Set-Content -LiteralPath (Get-SteamGridDbKeyPath) -Value (Protect-SteamGridDbKey $Key) -Encoding UTF8
+    $script:SgdbKey = $Key
+    $script:SgdbKeyLoaded = $true
+}
+
+function Remove-SteamGridDbApiKey
+{
+    foreach ($path in @((Get-SteamGridDbKeyPath), (Get-SteamGridDbLegacyKeyPath))) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $script:SgdbKey = $null
+    $script:SgdbKeyLoaded = $true
 }
 
 function Get-SteamGridDbApiKey
@@ -1072,9 +1133,24 @@ function Get-SteamGridDbApiKey
 
     $path = Get-SteamGridDbKeyPath
     if (Test-Path -LiteralPath $path -PathType Leaf) {
-        $key = (Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue)
+        $encoded = (Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue)
+        if ($encoded) { $encoded = $encoded.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($encoded)) {
+            $script:SgdbKey = Unprotect-SteamGridDbKey $encoded
+        }
+        return $script:SgdbKey
+    }
+
+    # Migrate a plaintext key written by an earlier version, then shred it.
+    $legacy = Get-SteamGridDbLegacyKeyPath
+    if (Test-Path -LiteralPath $legacy -PathType Leaf) {
+        $key = (Get-Content -LiteralPath $legacy -Raw -ErrorAction SilentlyContinue)
         if ($key) { $key = $key.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($key)) { $script:SgdbKey = $key }
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            Save-SteamGridDbApiKey $key
+            $__logger.Info('Non-Steam: migrated the SteamGridDB key to encrypted storage')
+        }
+        Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
     }
     return $script:SgdbKey
 }
@@ -1095,20 +1171,15 @@ function Set-SteamGridDbApiKey
 
     if (-not $answer.Result) { return }
 
-    $key  = "$($answer.SelectedString)".Trim()
-    $path = Get-SteamGridDbKeyPath
+    $key = "$($answer.SelectedString)".Trim()
 
     if ([string]::IsNullOrWhiteSpace($key)) {
-        if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
-        $script:SgdbKey = $null
-        $script:SgdbKeyLoaded = $true
+        Remove-SteamGridDbApiKey
         [void]$PlayniteApi.Dialogs.ShowMessage('SteamGridDB key cleared. Artwork will only come from Playnite.', 'Non-Steam Shortcuts')
         return
     }
 
-    Set-Content -LiteralPath $path -Value $key -Encoding UTF8
-    $script:SgdbKey = $key
-    $script:SgdbKeyLoaded = $true
+    Save-SteamGridDbApiKey $key
 
     # Prove the key works now rather than failing silently mid-run.
     $test = Invoke-SteamGridDbApi "search/autocomplete/$([uri]::EscapeDataString('portal'))" $key
@@ -1117,7 +1188,9 @@ function Set-SteamGridDbApiKey
             'Saved, but SteamGridDB did not accept that key. Check it and try again.',
             'Non-Steam Shortcuts')
     } else {
-        [void]$PlayniteApi.Dialogs.ShowMessage('SteamGridDB key saved and working.', 'Non-Steam Shortcuts')
+        [void]$PlayniteApi.Dialogs.ShowMessage(
+            'SteamGridDB key saved and working. It is encrypted with your Windows account, so the file is unreadable to other users and on other machines.',
+            'Non-Steam Shortcuts')
     }
 }
 

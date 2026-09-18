@@ -84,6 +84,14 @@ It needs a free API key from
 is checked against the API as you save it, so a bad one is caught there rather
 than failing quietly later. Clear the field to turn the fallback off again.
 
+The key is encrypted at rest with Windows DPAPI, tied to your Windows account on
+this machine, so `steamgriddb_api_key.dat` is unreadable to other users, useless
+if copied to another machine, and safe from being read over your shoulder or
+swept up by a backup or a sync client. It is not a vault: anything already
+running as you can ask DPAPI to decrypt it just as the extension does. A
+plaintext key written by an earlier version is migrated to encrypted storage the
+first time it is read, and the old file deleted.
+
 Without a key nothing is fetched and nothing is invented: Steam keeps its own
 plain name tile. Either way the results dialog lists any game that still has no
 artwork, so you always know which ones are bare.
