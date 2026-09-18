@@ -209,16 +209,33 @@ bare so you always know which ones they are.
 
 ## What works, and what does not
 
-*   **Games must be installed.** A shortcut is a path to an executable, so there
-    is nothing to point at until then. The target is verified before anything is
-    written, so an uninstalled game with a stale action cannot produce a dead
-    shortcut.
+*   **Games must be installed** — genuinely, not just marked as such. A shortcut
+    is a path to an executable, so there is nothing to point at until then. The
+    target is verified before anything is written, so an uninstalled game with a
+    stale action cannot produce a dead shortcut.
 
-*   **Games launched by a library plugin** (Epic, GOG, Ubisoft, and so on) store
-    no play action in Playnite — the plugin supplies one at launch. The extension
-    asks the owning plugin for it, so these work with no setup. If a plugin hands
-    back a URL rather than an executable the shortcut still works, but Steam
-    cannot attach the overlay to it.
+    Stores lie about this more than you would expect. Ubisoft Connect leaves a
+    registry entry and a `uplay_install.state` file behind after a game is
+    removed, so Playnite shows it as installed while the folder holds nothing.
+    Such games are skipped, correctly.
+
+*   **Games launched by a library plugin** store no play action in Playnite — the
+    plugin supplies one at launch. The extension asks the owning plugin for it,
+    but only some plugins expose a usable command line:
+
+    | Plugin | Hands back |
+    | ------ | ---------- |
+    | Amazon, Epic, GOG, Humble | a normal play action, used directly |
+    | Ubisoft, EA, Battle.net, itch.io, Xbox | their own play controller, carrying no command line |
+
+    For the second group there is nothing to read, so the executable is found by
+    scanning the install folder Playnite recorded, skipping installers,
+    redistributables and crash handlers, and preferring a name resembling the
+    game's. Those games are listed separately in the results, because it is a
+    guess worth checking; the log records which file was picked.
+
+    If a plugin hands back a URL rather than an executable the shortcut still
+    works, but Steam cannot attach the overlay to it.
 
 *   **Microsoft Store / Xbox Game Pass games** need special handling, because the
     Xbox plugin uses its own play controller and exposes no command line. The

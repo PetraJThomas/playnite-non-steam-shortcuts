@@ -711,6 +711,100 @@ function Get-SourcePlayAction
     return $candidates[0]
 }
 
+# Executables that are never the game, and folders that only ever hold
+# redistributables. Mirrors the exclusion list Playnite's own scanner uses.
+$script:NonGameExeNames = @(
+    'unins', 'uninstall', 'setup', 'dxsetup', 'vcredist', 'vc_redist', 'dotnet',
+    'directx', 'crashreport', 'crashhandler', 'unitycrashhandler', 'zsync',
+    'notification_helper', 'python', 'pythonw', 'launcher_helper', 'cleanup',
+    'activation', 'touchup', 'redist', 'benchmark', 'installer', 'helper',
+    'service', 'updater', 'errorreport', 'crashpad'
+)
+$script:NonGameDirNames = @(
+    'directx', 'redist', '_commonredist', 'commonredist', 'vcredist', 'dotnet',
+    'installer', 'support', 'prereq', 'prerequisites'
+)
+
+function Resolve-InstallDirLaunch
+{
+    <#
+        Last resort, and the generic answer to a problem that is not specific to
+        any one store: most library plugins (Ubisoft, EA, Battle.net, itch.io,
+        Xbox) return their own PlayController rather than an
+        AutomaticPlayController, so GetPlayActions gives us no command line at
+        all. Rather than a bespoke resolver per store, find the game's
+        executable inside the install folder Playnite already recorded.
+
+        This is a heuristic. It is reported separately so the target can be
+        checked, and it is only reached once every precise route has failed.
+    #>
+    param($Game)
+
+    if (-not $Game.IsInstalled) { return $null }
+
+    $dir = $Game.InstallDirectory
+    if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) {
+        return $null
+    }
+
+    $candidates = @()
+    try {
+        $candidates = @(Get-ChildItem -LiteralPath $dir -Filter '*.exe' -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+            Where-Object {
+                $name = $_.BaseName.ToLowerInvariant()
+                $parent = $_.Directory.Name.ToLowerInvariant()
+                $badName = $false
+                foreach ($bad in $script:NonGameExeNames) { if ($name -like "*$bad*") { $badName = $true; break } }
+                $badDir = $false
+                foreach ($bad in $script:NonGameDirNames) { if ($parent -eq $bad) { $badDir = $true; break } }
+                (-not $badName) -and (-not $badDir)
+            })
+    } catch {
+        $__logger.Warn("Non-Steam: could not scan $dir for $($Game.Name): $($_.Exception.Message)")
+        return $null
+    }
+
+    if ($candidates.Count -eq 0) {
+        # A store can report a game as installed when only a stub remains, so
+        # this is a normal outcome rather than a failure.
+        $__logger.Info("Non-Steam: no game executable under $dir for $($Game.Name); it may not really be installed")
+        return $null
+    }
+
+    $chosen = $candidates[0]
+    if ($candidates.Count -gt 1) {
+        # Prefer a name resembling the game's over merely the biggest file: the
+        # largest executable in a folder is often a redistributable installer.
+        $key = ($Game.Name -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+        $best = $null
+        $bestScore = -1
+        foreach ($exe in $candidates) {
+            $name = ($exe.BaseName -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+            $score = 0
+            if ($name -eq $key) { $score = 100 }
+            elseif ($name.Length -ge 4 -and $key.StartsWith($name)) { $score = 80 }
+            elseif ($key.Length -ge 4 -and $name.StartsWith($key)) { $score = 80 }
+            elseif ($name.Length -ge 4 -and $key -like "*$name*") { $score = 60 }
+            elseif ($key.Length -ge 4 -and $name -like "*$key*") { $score = 60 }
+
+            if ($score -gt $bestScore -or ($score -eq $bestScore -and $best -and $exe.Length -gt $best.Length)) {
+                $best = $exe
+                $bestScore = $score
+            }
+        }
+        if ($best) { $chosen = $best }
+    }
+
+    $__logger.Info("Non-Steam: picked $($chosen.FullName) for $($Game.Name) by scanning the install folder")
+    return @{
+        Exe        = $chosen.FullName
+        Arguments  = ''
+        WorkingDir = $chosen.Directory.FullName
+        IsUrl      = $false
+        Guessed    = $true
+    }
+}
+
 function Resolve-MicrosoftStoreLaunch
 {
     <#
@@ -1820,6 +1914,7 @@ function Invoke-ShortcutBuild
     $skippedNotInstalled = New-Object 'System.Collections.Generic.List[string]'
     $noOverlayGames      = New-Object 'System.Collections.Generic.List[string]'
     $noArtworkGames      = New-Object 'System.Collections.Generic.List[string]'
+    $guessedGames        = New-Object 'System.Collections.Generic.List[string]'
     $skippedDuplicate    = New-Object 'System.Collections.Generic.List[string]'
     $urlGames            = New-Object 'System.Collections.Generic.List[string]'
     $gamesToUpdate       = New-Object 'System.Collections.Generic.List[object]'
@@ -1862,12 +1957,19 @@ function Invoke-ShortcutBuild
             # so ask the owning plugin rather than skipping the game.
             $raw = Resolve-LibraryPluginLaunch $game
             if (-not $raw) {
-                # Some plugins (notably Xbox) use their own PlayController and
-                # expose no command line at all, so rebuild it ourselves.
+                # Most plugins use their own PlayController and expose no command
+                # line at all: Ubisoft, EA, Battle.net, itch.io and Xbox all do.
+                # Microsoft Store packages can be reconstructed exactly.
                 $raw = Resolve-MicrosoftStoreLaunch $game
+            }
+            if (-not $raw) {
+                # Everything else falls back to finding the executable inside the
+                # install folder Playnite recorded.
+                $raw = Resolve-InstallDirLaunch $game
             }
             $launch = Complete-LaunchSpec $game $raw
             if ($launch -and $raw.NoOverlay) { $launch.NoOverlay = $true }
+            if ($launch -and $raw.Guessed)   { $launch.Guessed   = $true }
         }
 
         if (-not $launch) {
@@ -1904,6 +2006,9 @@ function Invoke-ShortcutBuild
         if ($launch.IsUrl) {
             $__logger.Warn("Non-Steam: game launches via URL, Steam overlay will not work: $($game.Name)")
             $urlGames.Add($game.Name)
+        }
+        if ($launch.Guessed) {
+            $guessedGames.Add($game.Name)
         }
         if ($launch.NoOverlay) {
             $__logger.Warn("Non-Steam: game is shell-activated, Steam overlay will not attach: $($game.Name)")
@@ -2003,6 +2108,7 @@ function Invoke-ShortcutBuild
         SkippedNotInstalled = $skippedNotInstalled
         NoOverlayGames      = $noOverlayGames
         NoArtworkGames      = $noArtworkGames
+        GuessedGames        = $guessedGames
         SkippedDuplicate    = $skippedDuplicate
         UrlGames            = $urlGames
         GamesToUpdate       = $gamesToUpdate
@@ -2132,6 +2238,7 @@ function Invoke-NonSteamShortcuts
     $skippedNotInstalled = $build.SkippedNotInstalled
     $noOverlayGames      = $build.NoOverlayGames
     $noArtworkGames      = $build.NoArtworkGames
+    $guessedGames        = $build.GuessedGames
     $skippedDuplicate    = $build.SkippedDuplicate
     $urlGames            = $build.UrlGames
     $gamesToUpdate       = $build.GamesToUpdate
@@ -2142,7 +2249,7 @@ function Invoke-NonSteamShortcuts
         Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
             -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
             -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -UrlGames $urlGames -NothingWritten
+            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -GuessedGames $guessedGames -UrlGames $urlGames -NothingWritten
         return
     }
 
@@ -2218,7 +2325,7 @@ function Invoke-NonSteamShortcuts
     Show-ResultMessage -GamesNew $gamesNew -GamesUpdated $gamesUpdated -ArtCopied $artCopied `
         -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
         -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -UrlGames $urlGames
+            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -GuessedGames $guessedGames -UrlGames $urlGames
 }
 
 function Show-ResultMessage
@@ -2234,6 +2341,7 @@ function Show-ResultMessage
         $SkippedNotInstalled,
         $NoOverlayGames,
         $NoArtworkGames,
+        $GuessedGames,
         $UrlGames,
         [switch]$NothingWritten
     )
@@ -2296,6 +2404,12 @@ function Show-ResultMessage
             $message += ' tile. Giving them a cover in Playnite and running "replace Steam artwork" will fix it:' + $nl
         }
         $message += Format-GameList $NoArtworkGames
+    }
+    if ($GuessedGames.Count -gt 0) {
+        $message += $nl + $nl + "$($GuessedGames.Count) game(s) had no launch command from their store, so the"
+        $message += ' executable was found by scanning the install folder. Worth checking these actually start'
+        $message += ' from Steam; the log records which file was picked:' + $nl
+        $message += Format-GameList $GuessedGames
     }
     if ($NoOverlayGames.Count -gt 0) {
         $message += $nl + $nl + "$($NoOverlayGames.Count) of these are packaged Microsoft Store apps,"
