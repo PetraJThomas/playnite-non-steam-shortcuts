@@ -706,11 +706,16 @@ function Resolve-MicrosoftStoreLaunch
         AppId out of the package's AppxManifest.xml. We reconstruct the same
         thing here.
 
-        Most Game Pass PC titles declare EntryPoint="Windows.FullTrustApplication",
-        i.e. they are ordinary Win32 games in WindowsApps with a real .exe. For
-        those we target the executable directly, which keeps Steam attached to
-        the process so the overlay works. Genuine sandboxed UWP apps fall back to
-        shell activation, which launches but cannot carry the overlay.
+        Titles declaring EntryPoint="Windows.FullTrustApplication" have a real
+        .exe we can target directly, which gives Steam a process to track.
+        Packaged UWP apps cannot be started that way at all, so those are
+        activated through the shell instead.
+
+        Either way the game runs inside the Microsoft app container, so the
+        Steam overlay does not attach to Xbox / Game Pass titles. They launch
+        and Steam tracks them as running; the overlay is the part that does not
+        work, and that is a property of the sandbox rather than of the route
+        used to start them.
     #>
     param($Game)
 
@@ -761,10 +766,9 @@ function Resolve-MicrosoftStoreLaunch
     }
 
     # A packaged UWP app, or the executable could not be reached. Windows will
-    # not launch a UWP executable directly, so shell-activate it the way the
-    # Xbox plugin does; this starts the game correctly. Steam hands off to
-    # explorer.exe, which exits immediately, so Steam may lose track of the
-    # process and the overlay may not follow it in.
+    # not launch a UWP executable directly, so activate the package the way the
+    # Xbox plugin does. Verified working from Steam: the game starts and Steam
+    # follows it as a running game.
     $shell = "shell:AppsFolder\$pfn!$appId"
     $__logger.Info("Non-Steam: falling back to shell activation for $($Game.Name): $shell")
     return @{
@@ -1491,14 +1495,13 @@ function Show-ResultMessage
         $errors = $true
     }
     if ($NoOverlayGames.Count -gt 0) {
-        $message += $nl + $nl + "Created $($NoOverlayGames.Count) shortcut(s) for Microsoft Store apps."
-        $message += ' These are packaged UWP apps, which Windows will not start by running their executable,'
-        $message += ' so the shortcut shell-activates them instead. They launch fine. Steam hands off to the'
-        $message += ' launcher and that exits straight away, so playtime tracking and the overlay may not follow:' + $nl
+        $message += $nl + $nl + "$($NoOverlayGames.Count) of these are packaged Microsoft Store apps,"
+        $message += ' activated through the shell because Windows will not start them any other way:' + $nl
         $message += Format-GameList $NoOverlayGames
-        $errors = $true
     }
     if ($UrlGames.Count -gt 0) {
+        $message += $nl + $nl + 'Note: Xbox / Game Pass titles run inside the Microsoft app container, so they '
+        $message += 'launch and are tracked by Steam but the Steam overlay will not attach to them.'
         $message += $nl + $nl + 'Warning: some games launch via a URL (typically managed by a library plugin). '
         $message += 'Steam will still launch them, but the Steam overlay will not work. '
         $message += 'You may want to give them a direct file action and rerun this.'

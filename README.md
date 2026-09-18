@@ -2,8 +2,9 @@
 
 Creates non-Steam shortcuts in Steam for the games currently selected in Playnite,
 copies your Playnite artwork into Steam's grid folder, and rewrites the Playnite
-game to launch through Steam — so the Steam overlay works for any game in your
-library.
+game to launch through Steam — so the Steam overlay works for the games in your
+library that can accept it (see the notes below: sandboxed Xbox / Game Pass
+titles and URL-launched games cannot).
 
 Rerunning the extension is safe. It updates the existing shortcut using the
 action titled "Launch without Steam".
@@ -90,15 +91,17 @@ Steam tags.
     the Xbox plugin uses its own play controller and exposes no command line at
     all. The package's `AppxManifest.xml` is read instead:
 
-    *   Titles declaring `Windows.FullTrustApplication` are ordinary Win32 games
-        in a package, so the shortcut targets the executable directly and the
-        overlay works. Most Game Pass PC games are in this group.
-    *   Genuine UWP apps cannot be started by running their executable, so those
-        are shell-activated via `explorer.exe shell:AppsFolder\<package>!<app>`,
-        which is what the Xbox plugin itself does. They launch correctly. Steam
-        hands off to the launcher, which exits immediately, so playtime tracking
-        and the overlay may not follow; these are reported separately so you know
-        which ones they are.
+    *   Titles declaring `Windows.FullTrustApplication` have a real `.exe`, so
+        the shortcut targets it directly and Steam gets a process to track.
+    *   Packaged UWP apps cannot be started that way at all, so those are
+        activated via `explorer.exe shell:AppsFolder\<package>!<app>` — what the
+        Xbox plugin itself does. These are listed separately in the results so
+        you can see which shortcuts use that route.
+
+    Both launch correctly and Steam tracks them as running. **The Steam overlay
+    does not attach to Xbox / Game Pass games either way**, because the game runs
+    inside the Microsoft app container. That is a property of the sandbox, not of
+    how the shortcut starts them, so there is no way around it from here.
 
 *   **Games must be installed.** A shortcut is a path to an executable, and
     until a game is installed there is nothing to point at. The resolved target
