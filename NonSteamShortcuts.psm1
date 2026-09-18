@@ -1433,58 +1433,19 @@ function Add-NonSteamShortcutsReplacingArt
     Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt
 }
 
-function Invoke-NonSteamShortcuts
+function Invoke-ShortcutBuild
 {
-    param($scriptGameMenuItemActionArgs, [switch]$ReplaceArt)
+    <#
+        Walks the selected games and builds their shortcut entries. Pulled out
+        of Invoke-NonSteamShortcuts so it can run inside Playnite's progress
+        dialog: looking a game up on SteamGridDB is a network round trip, and
+        without this the window just sits there looking hung.
 
-    $games = $scriptGameMenuItemActionArgs.Games
-    if (-not $games -or $games.Count -eq 0) {
-        [void]$PlayniteApi.Dialogs.ShowMessage('No games selected.', 'Non-Steam Shortcuts')
-        return
-    }
+        $Progress is a GlobalProgressActionArgs, or $null to run without any UI.
+    #>
+    param($Games, [string]$GridDir, $SteamShortcuts, [switch]$ReplaceArt, $Progress)
 
-    $steamUserdata = Get-SelectedSteamUserdataFolder
-    if (-not (Test-SteamUserdataDir $steamUserdata)) { return }
-
-    if (Get-Process -Name 'steam' -ErrorAction SilentlyContinue) {
-        $answer = $PlayniteApi.Dialogs.ShowMessage(
-            "Steam is running. It rewrites shortcuts.vdf when it exits, which would discard these shortcuts." +
-            [Environment]::NewLine + [Environment]::NewLine +
-            "Close Steam first, then run this again." +
-            [Environment]::NewLine + [Environment]::NewLine +
-            "Continue anyway?",
-            'Non-Steam Shortcuts',
-            [System.Windows.MessageBoxButton]::YesNo,
-            [System.Windows.MessageBoxImage]::Warning)
-        if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
-    }
-
-    $shortcutsVdf = Join-Path $steamUserdata 'config\shortcuts.vdf'
-    $gridDir      = Join-Path $steamUserdata 'config\grid'
-    $backupPath   = $null
-
-    if (-not (Test-Path -LiteralPath $gridDir -PathType Container)) {
-        New-Item -ItemType Directory -Path $gridDir -Force | Out-Null
-    }
-
-    # Load existing shortcuts
-    if (Test-Path -LiteralPath $shortcutsVdf -PathType Leaf) {
-        try {
-            $backupPath = Backup-ShortcutsVdf $shortcutsVdf
-        } catch {
-            [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error backing up shortcuts.vdf')
-            return
-        }
-        try {
-            $steamShortcuts = Read-ShortcutsVdf $shortcutsVdf
-        } catch {
-            [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error loading shortcuts.vdf')
-            return
-        }
-    } else {
-        $steamShortcuts = New-Object 'System.Collections.Generic.List[object]'
-    }
-
+    $cancelled = $false
     $gamesUpdated        = 0
     $gamesNew            = 0
     $artCopied           = 0
@@ -1499,7 +1460,19 @@ function Invoke-NonSteamShortcuts
     $gamesToUpdate       = New-Object 'System.Collections.Generic.List[object]'
     $namesThisRun        = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
+    $processed = 0
     foreach ($game in $games) {
+
+        if ($Progress) {
+            if ($Progress.CancelToken.IsCancellationRequested) {
+                $__logger.Info('Non-Steam: cancelled by the user')
+                $cancelled = $true
+                break
+            }
+            $Progress.CurrentProgressValue = $processed
+            $Progress.Text = "Reading $($game.Name)  ($($processed + 1) of $($games.Count))"
+        }
+        $processed++
 
         if ($game.PluginId -eq $script:SteamPluginId) {
             $__logger.Warn("Non-Steam: game is already a Steam game: $($game.Name)")
@@ -1581,7 +1554,7 @@ function Invoke-NonSteamShortcuts
         $quotedExe      = '"{0}"' -f $launch.Exe
         $quotedStartDir = '"{0}"' -f $launch.StartDir
 
-        $existing = Find-ShortcutEntry $steamShortcuts $game.Name
+        $existing = Find-ShortcutEntry $SteamShortcuts $game.Name
 
         # Reuse whatever app id this shortcut already has. Steam names grid
         # artwork after the appid field, so replacing it with our own would
@@ -1615,22 +1588,25 @@ function Invoke-NonSteamShortcuts
             foreach ($k in $script:ShortcutDefaults.Keys) {
                 $shortcut[$k] = $script:ShortcutDefaults[$k]
             }
-            $steamShortcuts.Add($shortcut)
+            $SteamShortcuts.Add($shortcut)
         }
 
         $shortcut['tags'] = Merge-SteamTags $shortcut $game
 
-        $artCopied += Copy-SteamGridArt $gridDir $appId $game -Overwrite:$ReplaceArt
+        $artCopied += Copy-SteamGridArt $GridDir $appId $game -Overwrite:$ReplaceArt
 
         # Steam falls back to a plain name tile when there is no library
         # capsule. That is usually because Playnite has no cover for the
         # game, which is worth saying rather than leaving to be noticed.
-        $portrait = @(Get-ChildItem -LiteralPath $gridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
+        $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
         if ($portrait.Count -eq 0 -or $ReplaceArt) {
+            if ($Progress -and -not [string]::IsNullOrWhiteSpace((Get-SteamGridDbApiKey))) {
+                $Progress.Text = "Searching SteamGridDB for $($game.Name)  ($processed of $($games.Count))"
+            }
             # Playnite had nothing to copy (or we were told to replace), so try
             # SteamGridDB. Does nothing unless an API key has been set.
-            $artCopied += Copy-SteamGridDbArt $gridDir $appId $game.Name -Overwrite:$ReplaceArt
-            $portrait = @(Get-ChildItem -LiteralPath $gridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
+            $artCopied += Copy-SteamGridDbArt $GridDir $appId $game.Name -Overwrite:$ReplaceArt
+            $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
         }
         if ($portrait.Count -eq 0) {
             $__logger.Info("Non-Steam: no library artwork for $($game.Name)")
@@ -1644,6 +1620,141 @@ function Invoke-NonSteamShortcuts
             SteamUrl     = Get-SteamRunGameUrl $appId
         })
     }
+
+
+    return @{
+        GamesNew            = $gamesNew
+        GamesUpdated        = $gamesUpdated
+        ArtCopied           = $artCopied
+        SkippedNoAction     = $skippedNoAction
+        SkippedSteamNative  = $skippedSteamNative
+        SkippedUnresolvable = $skippedUnresolvable
+        SkippedNotInstalled = $skippedNotInstalled
+        NoOverlayGames      = $noOverlayGames
+        NoArtworkGames      = $noArtworkGames
+        SkippedDuplicate    = $skippedDuplicate
+        UrlGames            = $urlGames
+        GamesToUpdate       = $gamesToUpdate
+        Shortcuts           = $SteamShortcuts
+        Cancelled           = $cancelled
+    }
+}
+
+function Invoke-NonSteamShortcuts
+{
+    param($scriptGameMenuItemActionArgs, [switch]$ReplaceArt)
+
+    $games = $scriptGameMenuItemActionArgs.Games
+    if (-not $games -or $games.Count -eq 0) {
+        [void]$PlayniteApi.Dialogs.ShowMessage('No games selected.', 'Non-Steam Shortcuts')
+        return
+    }
+
+    $steamUserdata = Get-SelectedSteamUserdataFolder
+    if (-not (Test-SteamUserdataDir $steamUserdata)) { return }
+
+    if (Get-Process -Name 'steam' -ErrorAction SilentlyContinue) {
+        $answer = $PlayniteApi.Dialogs.ShowMessage(
+            "Steam is running. It rewrites shortcuts.vdf when it exits, which would discard these shortcuts." +
+            [Environment]::NewLine + [Environment]::NewLine +
+            "Close Steam first, then run this again." +
+            [Environment]::NewLine + [Environment]::NewLine +
+            "Continue anyway?",
+            'Non-Steam Shortcuts',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning)
+        if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    }
+
+    $shortcutsVdf = Join-Path $steamUserdata 'config\shortcuts.vdf'
+    $gridDir      = Join-Path $steamUserdata 'config\grid'
+    $backupPath   = $null
+
+    if (-not (Test-Path -LiteralPath $gridDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $gridDir -Force | Out-Null
+    }
+
+    # Load existing shortcuts
+    if (Test-Path -LiteralPath $shortcutsVdf -PathType Leaf) {
+        try {
+            $backupPath = Backup-ShortcutsVdf $shortcutsVdf
+        } catch {
+            [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error backing up shortcuts.vdf')
+            return
+        }
+        try {
+            $steamShortcuts = Read-ShortcutsVdf $shortcutsVdf
+        } catch {
+            [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error loading shortcuts.vdf')
+            return
+        }
+    } else {
+        $steamShortcuts = New-Object 'System.Collections.Generic.List[object]'
+    }
+
+    # Run the walk inside Playnite's progress dialog. The scriptblock is invoked
+    # on a background thread, so state crosses the boundary through $script:
+    # variables rather than a closure.
+    $script:BuildInput  = @{
+        Games      = $games
+        GridDir    = $gridDir
+        Shortcuts  = $steamShortcuts
+        ReplaceArt = [bool]$ReplaceArt
+    }
+    $script:BuildResult = $null
+    $script:BuildError  = $null
+
+    try {
+        $options = New-Object Playnite.SDK.GlobalProgressOptions('Creating non-Steam shortcuts...', $true)
+        $options.IsIndeterminate = $false
+        [void]$PlayniteApi.Dialogs.ActivateGlobalProgress({
+                param($progress)
+                $progress.ProgressMaxValue = $script:BuildInput.Games.Count
+                try {
+                    $script:BuildResult = Invoke-ShortcutBuild `
+                        -Games      $script:BuildInput.Games `
+                        -GridDir    $script:BuildInput.GridDir `
+                        -SteamShortcuts $script:BuildInput.Shortcuts `
+                        -ReplaceArt:$script:BuildInput.ReplaceArt `
+                        -Progress   $progress
+                } catch {
+                    $script:BuildError = $_
+                }
+            }, $options)
+    } catch {
+        $script:BuildError = $_
+    }
+
+    if ($script:BuildError) {
+        $__logger.Error("Non-Steam: progress dialog failed, continuing without it: $($script:BuildError.Exception.Message)")
+    }
+    if ($null -eq $script:BuildResult) {
+        # Either the dialog could not run the action or it failed. Do the work
+        # anyway rather than silently doing nothing; the window will block.
+        $__logger.Warn('Non-Steam: running without the progress dialog')
+        $script:BuildResult = Invoke-ShortcutBuild `
+            -Games $games -GridDir $gridDir -SteamShortcuts $steamShortcuts -ReplaceArt:$ReplaceArt -Progress $null
+    }
+
+    $build = $script:BuildResult
+    if ($build.Cancelled) {
+        $__logger.Info('Non-Steam: run cancelled, shortcuts.vdf left untouched')
+        return
+    }
+
+    $gamesNew            = $build.GamesNew
+    $gamesUpdated        = $build.GamesUpdated
+    $artCopied           = $build.ArtCopied
+    $skippedNoAction     = $build.SkippedNoAction
+    $skippedSteamNative  = $build.SkippedSteamNative
+    $skippedUnresolvable = $build.SkippedUnresolvable
+    $skippedNotInstalled = $build.SkippedNotInstalled
+    $noOverlayGames      = $build.NoOverlayGames
+    $noArtworkGames      = $build.NoArtworkGames
+    $skippedDuplicate    = $build.SkippedDuplicate
+    $urlGames            = $build.UrlGames
+    $gamesToUpdate       = $build.GamesToUpdate
+    $steamShortcuts      = $build.Shortcuts
 
     if ($gamesToUpdate.Count -eq 0) {
         # Nothing resolved, so do not rewrite a file we have no changes for.
