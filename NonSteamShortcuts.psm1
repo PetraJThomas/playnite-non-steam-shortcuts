@@ -1217,15 +1217,38 @@ function Invoke-SteamGridDbApi
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     } catch { }
 
-    try {
-        $response = Invoke-RestMethod -Uri "$script:SgdbApiBase/$Path" `
-                                      -Headers @{ Authorization = "Bearer $Key" } `
-                                      -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
-        if ($response -and $response.success) { return $response.data }
-        return $null
-    } catch {
-        $__logger.Warn("Non-Steam: SteamGridDB request failed for '$Path': $($_.Exception.Message)")
-        return $null
+    # A mass run makes hundreds of requests, so back off and retry on 429 rather
+    # than reporting a rate-limited game as having no artwork.
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $response = Invoke-RestMethod -Uri "$script:SgdbApiBase/$Path" `
+                                          -Headers @{ Authorization = "Bearer $Key" } `
+                                          -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+            if ($response -and $response.success) { return $response.data }
+            return $null
+        } catch {
+            $status = $null
+            try { $status = $_.Exception.Response.StatusCode.value__ } catch { }
+
+            if (($status -eq 429 -or $status -ge 500) -and $attempt -lt 4) {
+                $wait = [Math]::Pow(2, $attempt)   # 2s, 4s, 8s
+                $__logger.Warn("Non-Steam: SteamGridDB returned $status, waiting $wait s then retrying ($attempt of 3)")
+                Start-Sleep -Seconds $wait
+                continue
+            }
+
+            if ($status -eq 401 -or $status -eq 403) {
+                # The key is bad. Stop asking for the rest of the run.
+                $__logger.Error('Non-Steam: SteamGridDB rejected the API key; skipping it for the rest of this run')
+                $script:SgdbKey = $null
+                return $null
+            }
+
+            $__logger.Warn("Non-Steam: SteamGridDB request failed for '$Path': $($_.Exception.Message)")
+            return $null
+        }
     }
 }
 
