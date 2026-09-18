@@ -1,4 +1,4 @@
-# Non-Steam Shortcuts for Playnite 10 (SDK 6)
+﻿# Non-Steam Shortcuts for Playnite 10 (SDK 6)
 #
 # Originally an IronPython extension by Blake Burkhart (MIT licensed).
 # IronPython support was removed in Playnite 9, so this is a PowerShell port.
@@ -431,9 +431,10 @@ function Find-SteamUserdataDirs
         }
     }
 
-    # Comma matters: a bare List with one item is unrolled to a bare string on
-    # return, and the caller would then index it as a char array.
-    return ,$found
+    # Returned as a string[] rather than a List, and wrapped with a comma so a
+    # single result is not unrolled into a bare string that the caller would
+    # then index one character at a time.
+    return ,([string[]]$found.ToArray())
 }
 
 function Set-SteamUserdataFolder
@@ -458,8 +459,10 @@ function Select-SteamUserdataFolder
         if (Test-SteamUserdataDir $saved) { return $saved }
     }
 
-    # @() so a single result cannot arrive as a bare string
-    $candidates = @(Find-SteamUserdataDirs)
+    # Assigned directly: the function already returns a string[], and wrapping
+    # it in @() would produce a one-element array holding the array itself,
+    # which then renders as its type name instead of the paths.
+    $candidates = Find-SteamUserdataDirs
 
     if (-not $Force -and $candidates.Count -eq 1 -and (Test-SteamUserdataDir $candidates[0])) {
         Set-Content -LiteralPath $configPath -Value $candidates[0] -Encoding UTF8
@@ -538,6 +541,72 @@ function Get-SourcePlayAction
         if ($action.Name -eq $script:LaunchWithoutSteamName) { return $action }
     }
     return $candidates[0]
+}
+
+function Resolve-LibraryPluginLaunch
+{
+    <#
+        Library plugins (Ubisoft Connect, Epic, GOG, Xbox, ...) usually store no
+        play action in the database at all - they hand one to Playnite at launch
+        time. Those games would otherwise all be skipped, so ask the owning
+        plugin directly for what it would have run.
+    #>
+    param($Game)
+
+    if ($Game.PluginId -eq [Guid]::Empty) { return $null }
+
+    $plugin = $null
+    foreach ($p in $PlayniteApi.Addons.Plugins) {
+        if ($p.Id -eq $Game.PluginId -and $p -is [Playnite.SDK.Plugins.LibraryPlugin]) {
+            $plugin = $p
+            break
+        }
+    }
+    if (-not $plugin) { return $null }
+
+    $controllers = $null
+    try {
+        $playArgs = New-Object Playnite.SDK.Plugins.GetPlayActionsArgs
+        $playArgs.Game = $Game
+        $controllers = $plugin.GetPlayActions($playArgs)
+    } catch {
+        $__logger.Error("Non-Steam: $($plugin.Name) could not supply a play action for $($Game.Name): $($_.Exception.Message)")
+        return $null
+    }
+    if (-not $controllers) { return $null }
+
+    $result = $null
+    $seen   = 0
+    foreach ($controller in $controllers) {
+        $seen++
+        if ($null -eq $result -and
+            $controller -is [Playnite.SDK.Plugins.AutomaticPlayController] -and
+            -not [string]::IsNullOrWhiteSpace($controller.Path)) {
+
+            $isUrl = ($controller.Type -eq [Playnite.SDK.Plugins.AutomaticPlayActionType]::Url)
+            $__logger.Info("Non-Steam: $($plugin.Name) supplied a $($controller.Type) play action for $($Game.Name): $($controller.Path)")
+            $result = @{
+                Exe        = $controller.Path
+                Arguments  = if ($controller.Arguments) { $controller.Arguments } else { '' }
+                WorkingDir = $controller.WorkingDir
+                IsUrl      = $isUrl
+            }
+        }
+        elseif ($null -eq $result) {
+            # Not an AutomaticPlayController, so the plugin launches this game
+            # with its own code and exposes no command line we can hand to Steam.
+            # Log the concrete type so it is obvious why the game was skipped.
+            $__logger.Warn("Non-Steam: $($plugin.Name) returned a $($controller.GetType().Name) for $($Game.Name), which carries no launch command")
+        }
+        # Controllers hold process handles; release them whether or not we used one.
+        if ($controller -is [System.IDisposable]) {
+            try { $controller.Dispose() } catch { }
+        }
+    }
+    if ($seen -eq 0) {
+        $__logger.Warn("Non-Steam: $($plugin.Name) returned no play controllers for $($Game.Name)")
+    }
+    return $result
 }
 
 function Resolve-EmulatorLaunch
@@ -660,17 +729,13 @@ function Resolve-GameLaunch
         }
 
         ([Playnite.SDK.Models.GameActionType]::URL) {
-            $expanded = $PlayniteApi.ExpandGameVariables($Game, $Action)
-            # Never build a shortcut that points back at a Steam shortcut.
-            if ($expanded.Path -and $expanded.Path.StartsWith($script:RunGameIdPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $__logger.Error("Non-Steam: refusing to use a steam://rungameid URL as the launch target for $($Game.Name)")
-                return $null
-            }
             # Steam will still launch it, but cannot inject the overlay.
-            return @{
+            # Complete-LaunchSpec rejects a steam://rungameid target.
+            $expanded = $PlayniteApi.ExpandGameVariables($Game, $Action)
+            $launch = @{
                 Exe        = $expanded.Path
                 Arguments  = ''
-                StartDir   = ''
+                WorkingDir = ''
                 IsUrl      = $true
             }
         }
@@ -681,10 +746,36 @@ function Resolve-GameLaunch
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($launch.Exe)) { return $null }
+    return Complete-LaunchSpec $Game $launch
+}
 
-    $exe     = $launch.Exe
-    $workDir = $launch.WorkingDir
+function Complete-LaunchSpec
+{
+    <#
+        Turn a raw Exe/Arguments/WorkingDir triple into the final shape Steam
+        wants, filling in a working directory and rooting the executable.
+        Shared by the stored-action and library-plugin resolution paths.
+    #>
+    param($Game, $Launch)
+
+    if (-not $Launch) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Launch.Exe)) { return $null }
+
+    if ($Launch.IsUrl) {
+        if ($Launch.Exe.StartsWith($script:RunGameIdPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $__logger.Error("Non-Steam: refusing to use a steam://rungameid URL as the launch target for $($Game.Name)")
+            return $null
+        }
+        return @{
+            Exe       = $Launch.Exe
+            Arguments = ''
+            StartDir  = ''
+            IsUrl     = $true
+        }
+    }
+
+    $exe     = $Launch.Exe
+    $workDir = $Launch.WorkingDir
 
     if ([string]::IsNullOrWhiteSpace($workDir)) {
         # Only safe for a rooted path; a bare relative exe would otherwise
@@ -702,7 +793,7 @@ function Resolve-GameLaunch
 
     return @{
         Exe       = $exe
-        Arguments = $launch.Arguments
+        Arguments = $Launch.Arguments
         StartDir  = $workDir
         IsUrl     = $false
     }
@@ -881,6 +972,7 @@ function Invoke-NonSteamShortcuts
     $skippedNoAction     = New-Object 'System.Collections.Generic.List[string]'
     $skippedSteamNative  = New-Object 'System.Collections.Generic.List[string]'
     $skippedUnresolvable = New-Object 'System.Collections.Generic.List[string]'
+    $skippedNotInstalled = New-Object 'System.Collections.Generic.List[string]'
     $skippedDuplicate    = New-Object 'System.Collections.Generic.List[string]'
     $urlGames            = New-Object 'System.Collections.Generic.List[string]'
     $gamesToUpdate       = New-Object 'System.Collections.Generic.List[object]'
@@ -903,16 +995,26 @@ function Invoke-NonSteamShortcuts
         }
 
         $sourceAction = Get-SourcePlayAction $game
-        if (-not $sourceAction) {
-            $__logger.Error("Non-Steam: game has no usable play action: $($game.Name)")
-            $skippedNoAction.Add($game.Name)
-            continue
+
+        if ($sourceAction) {
+            $launch = Resolve-GameLaunch $game $sourceAction
+        } else {
+            # No stored action. Library plugins supply theirs at launch time,
+            # so ask the owning plugin rather than skipping the game.
+            $launch = Complete-LaunchSpec $game (Resolve-LibraryPluginLaunch $game)
         }
 
-        $launch = Resolve-GameLaunch $game $sourceAction
         if (-not $launch) {
-            $__logger.Error("Non-Steam: could not resolve a launch command for: $($game.Name)")
-            $skippedUnresolvable.Add($game.Name)
+            if (-not $game.IsInstalled) {
+                $__logger.Warn("Non-Steam: game is not installed, nothing to launch: $($game.Name)")
+                $skippedNotInstalled.Add($game.Name)
+            } elseif (-not $sourceAction) {
+                $__logger.Error("Non-Steam: no play action and its library plugin supplied none: $($game.Name)")
+                $skippedNoAction.Add($game.Name)
+            } else {
+                $__logger.Error("Non-Steam: could not resolve a launch command for: $($game.Name)")
+                $skippedUnresolvable.Add($game.Name)
+            }
             continue
         }
 
@@ -984,7 +1086,7 @@ function Invoke-NonSteamShortcuts
         Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
             -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
             -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -UrlGames $urlGames -NothingWritten
+            -SkippedNotInstalled $skippedNotInstalled -UrlGames $urlGames -NothingWritten
         return
     }
 
@@ -1009,6 +1111,11 @@ function Invoke-NonSteamShortcuts
         $game         = $item.Game
         $sourceAction = $item.SourceAction
 
+        # A library-plugin game may have no GameActions collection at all.
+        if (-not $game.GameActions) {
+            $game.GameActions = New-Object 'System.Collections.ObjectModel.ObservableCollection[Playnite.SDK.Models.GameAction]'
+        }
+
         $steamAction = $null
         foreach ($action in $game.GameActions) {
             if ($action.Name -eq $script:SteamActionName) { $steamAction = $action; break }
@@ -1029,16 +1136,20 @@ function Invoke-NonSteamShortcuts
         }
 
         # Label the original so a rerun can find it, unless a previous run
-        # already stashed a different action under that name.
-        $nameTaken = $false
-        foreach ($action in $game.GameActions) {
-            if (-not [object]::ReferenceEquals($action, $sourceAction) -and
-                $action.Name -eq $script:LaunchWithoutSteamName) {
-                $nameTaken = $true
-                break
+        # already stashed a different action under that name. Games whose action
+        # came from their library plugin have nothing stored to rename; the
+        # plugin keeps supplying it, so a rerun resolves them the same way.
+        if ($sourceAction) {
+            $nameTaken = $false
+            foreach ($action in $game.GameActions) {
+                if (-not [object]::ReferenceEquals($action, $sourceAction) -and
+                    $action.Name -eq $script:LaunchWithoutSteamName) {
+                    $nameTaken = $true
+                    break
+                }
             }
+            if (-not $nameTaken) { $sourceAction.Name = $script:LaunchWithoutSteamName }
         }
-        if (-not $nameTaken) { $sourceAction.Name = $script:LaunchWithoutSteamName }
 
         # Only the Steam action should be the play action
         foreach ($action in $game.GameActions) {
@@ -1051,7 +1162,7 @@ function Invoke-NonSteamShortcuts
     Show-ResultMessage -GamesNew $gamesNew -GamesUpdated $gamesUpdated -ArtCopied $artCopied `
         -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
         -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-        -UrlGames $urlGames
+            -SkippedNotInstalled $skippedNotInstalled -UrlGames $urlGames
 }
 
 function Show-ResultMessage
@@ -1064,6 +1175,7 @@ function Show-ResultMessage
         $SkippedNoAction,
         $SkippedUnresolvable,
         $SkippedDuplicate,
+        $SkippedNotInstalled,
         $UrlGames,
         [switch]$NothingWritten
     )
@@ -1078,7 +1190,7 @@ function Show-ResultMessage
     $nl = [Environment]::NewLine
 
     if ($NothingWritten) {
-        $message = 'Nothing to do — shortcuts.vdf was left untouched.' + $nl
+        $message = 'Nothing to do - shortcuts.vdf was left untouched.' + $nl
     } else {
         $message  = 'Please relaunch Steam to pick up the new non-Steam shortcuts.' + $nl + $nl
         $message += "Created $GamesNew new non-Steam shortcut(s)" + $nl
@@ -1098,9 +1210,17 @@ function Show-ResultMessage
         $message += Format-GameList $SkippedDuplicate
         $errors = $true
     }
+    if ($SkippedNotInstalled.Count -gt 0) {
+        $message += $nl + $nl + "Skipped $($SkippedNotInstalled.Count) game(s) that are not installed:" + $nl
+        $message += Format-GameList $SkippedNotInstalled
+        $errors = $true
+    }
     if ($SkippedNoAction.Count -gt 0) {
-        $message += $nl + $nl + "Skipped $($SkippedNoAction.Count) game(s) with no play action (not installed, or launched by a library plugin):" + $nl
+        $message += $nl + $nl + "Skipped $($SkippedNoAction.Count) game(s) with no play action, whose library plugin also supplied none:" + $nl
         $message += Format-GameList $SkippedNoAction
+        $message += $nl + $nl + 'Microsoft Store / Xbox Game Pass titles usually land here. They are launched '
+        $message += 'through the Store rather than by a command line, and being sandboxed UWP apps the Steam '
+        $message += 'overlay cannot attach to them anyway. The log records what each plugin returned.'
         $errors = $true
     }
     if ($SkippedUnresolvable.Count -gt 0) {
