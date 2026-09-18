@@ -70,7 +70,7 @@ function GetMainMenuItems
     param($getMainMenuItemsArgs)
 
     $item = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
-    $item.Description  = 'Set Steam userdata folder...'
+    $item.Description  = 'Find Steam Install Folder'
     $item.FunctionName = 'Set-SteamUserdataFolder'
     $item.MenuSection  = '@Non-Steam Shortcuts'
     return $item
@@ -376,10 +376,24 @@ function Backup-ShortcutsVdf
 
 function Test-SteamUserdataDir
 {
+    <#
+        A Steam userdata profile folder is userdata\<numeric account id> and has
+        a config subfolder. Checking only for "config" is not enough: the Steam
+        install root has one too, and accepting it silently writes shortcuts
+        where Steam will never read them.
+    #>
     param([string]$Folder)
 
-    return (-not [string]::IsNullOrWhiteSpace($Folder)) -and
-           (Test-Path -LiteralPath (Join-Path $Folder 'config') -PathType Container)
+    if ([string]::IsNullOrWhiteSpace($Folder)) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $Folder 'config') -PathType Container)) { return $false }
+
+    try {
+        $leaf   = Split-Path -Leaf $Folder
+        $parent = Split-Path -Leaf (Split-Path -Parent $Folder)
+    } catch {
+        return $false
+    }
+    return ($leaf -match '^\d+$') -and ($parent -eq 'userdata')
 }
 
 function Get-SteamUserdataConfigPath
@@ -390,51 +404,152 @@ function Get-SteamUserdataConfigPath
     return (Join-Path $CurrentExtensionDataPath 'steam_userdata_path.txt')
 }
 
-function Find-SteamUserdataDirs
+function Get-SteamPersonaNames
 {
     <#
-        Locate candidate userdata\<steamid> folders from the Steam install
-        recorded in the registry, falling back to the usual install locations.
+        Map account id -> persona name from <steam root>\config\loginusers.vdf,
+        purely so the profile picker can show a name instead of a bare number.
+        loginusers.vdf keys profiles by 64 bit SteamID; the userdata folder is
+        named with the lower 32 bits of it.
     #>
-    $steamRoots = New-Object 'System.Collections.Generic.List[string]'
+    param([string]$SteamRoot)
+
+    $names = @{}
+    if ([string]::IsNullOrWhiteSpace($SteamRoot)) { return $names }
+    $path = Join-Path $SteamRoot 'config\loginusers.vdf'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $names }
+
+    try {
+        $text = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+    } catch {
+        return $names
+    }
+
+    $steamId = $null
+    foreach ($line in ($text -split "`n")) {
+        if ($line -match '^\s*"(\d{17})"\s*$') {
+            $steamId = [uint64]$Matches[1]
+            continue
+        }
+        if ($null -ne $steamId -and $line -match '^\s*"PersonaName"\s+"(.*)"\s*$') {
+            $accountId = $steamId - [uint64]76561197960265728
+            $names["$accountId"] = $Matches[1]
+            $steamId = $null
+        }
+    }
+    return $names
+}
+
+function Get-SteamInstallRoots
+{
+    $roots = New-Object 'System.Collections.Generic.List[string]'
 
     foreach ($key in @('HKCU:\Software\Valve\Steam', 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam', 'HKLM:\SOFTWARE\Valve\Steam')) {
         try {
             $props = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
             foreach ($name in @('SteamPath', 'InstallPath')) {
                 $value = $props.$name
-                if (-not [string]::IsNullOrWhiteSpace($value)) { $steamRoots.Add($value) }
+                if (-not [string]::IsNullOrWhiteSpace($value)) { $roots.Add($value) }
             }
         } catch { }
     }
+    $roots.Add("${env:ProgramFiles(x86)}\Steam")
+    $roots.Add("$env:ProgramFiles\Steam")
+    return ,([string[]]$roots.ToArray())
+}
 
-    $steamRoots.Add("${env:ProgramFiles(x86)}\Steam")
-    $steamRoots.Add("$env:ProgramFiles\Steam")
+function Get-SteamProfilesUnder
+{
+    <#
+        Given anything sensible - a Steam install root, a userdata folder, or a
+        profile folder itself - return the profile folders it contains.
+    #>
+    param([string]$Path)
 
-    # Steam writes SteamPath lowercased and with forward slashes, while the
-    # fallbacks are proper-cased with backslashes, so compare normalised paths
-    # case insensitively or the same folder gets offered twice.
+    $found = New-Object 'System.Collections.Generic.List[string]'
+    if ([string]::IsNullOrWhiteSpace($Path)) { return ,([string[]]@()) }
+
+    # The profile folder itself
+    if (Test-SteamUserdataDir $Path) {
+        $found.Add($Path)
+        return ,([string[]]$found.ToArray())
+    }
+
+    # A userdata folder, or a Steam root containing one
+    $userdata = $Path
+    if ((Split-Path -Leaf $Path) -ne 'userdata') {
+        $userdata = Join-Path $Path 'userdata'
+    }
+    if (-not (Test-Path -LiteralPath $userdata -PathType Container)) {
+        return ,([string[]]@())
+    }
+
+    foreach ($dir in (Get-ChildItem -LiteralPath $userdata -Directory -ErrorAction SilentlyContinue)) {
+        # "0" and "anonymous" are not real accounts
+        if ($dir.Name -eq '0' -or $dir.Name -eq 'anonymous') { continue }
+        if (Test-SteamUserdataDir $dir.FullName) { $found.Add($dir.FullName) }
+    }
+    return ,([string[]]$found.ToArray())
+}
+
+function Find-SteamUserdataDirs
+{
+    <#
+        Every Steam profile on this machine, de-duplicated. Steam writes
+        SteamPath lowercased with forward slashes while the fallbacks are
+        proper-cased with backslashes, so paths are normalised before comparing
+        or the same folder gets offered twice.
+    #>
     $seen  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $found = New-Object 'System.Collections.Generic.List[string]'
 
-    foreach ($root in $steamRoots) {
-        $userdata = Join-Path $root 'userdata'
-        if (-not (Test-Path -LiteralPath $userdata -PathType Container)) { continue }
-        foreach ($dir in (Get-ChildItem -LiteralPath $userdata -Directory -ErrorAction SilentlyContinue)) {
-            # "0" and "anonymous" are not real accounts
-            if ($dir.Name -eq '0' -or $dir.Name -eq 'anonymous') { continue }
-            if (-not (Test-SteamUserdataDir $dir.FullName)) { continue }
-
-            $normalised = $dir.FullName
+    foreach ($root in (Get-SteamInstallRoots)) {
+        foreach ($profileDir in (Get-SteamProfilesUnder $root)) {
+            $normalised = $profileDir
             try { $normalised = [System.IO.Path]::GetFullPath($normalised).TrimEnd('\') } catch { }
             if ($seen.Add($normalised)) { $found.Add($normalised) }
         }
     }
-
-    # Returned as a string[] rather than a List, and wrapped with a comma so a
-    # single result is not unrolled into a bare string that the caller would
-    # then index one character at a time.
     return ,([string[]]$found.ToArray())
+}
+
+function Select-SteamProfileInteractively
+{
+    <#
+        More than one Steam account on this machine, so ask which to use.
+        Labelled with the persona name wherever loginusers.vdf provides one.
+    #>
+    param([string[]]$Profiles)
+
+    if ($null -eq $Profiles -or $Profiles.Count -eq 0) { return $null }
+    if ($Profiles.Count -eq 1) { return $Profiles[0] }
+
+    # Persona names live in the Steam root, two levels above a profile folder.
+    $steamRoot = $null
+    try { $steamRoot = Split-Path -Parent (Split-Path -Parent $Profiles[0]) } catch { }
+    $names = Get-SteamPersonaNames $steamRoot
+
+    $options = New-Object 'System.Collections.Generic.List[Playnite.SDK.MessageBoxOption]'
+    $byTitle = @{}
+    $first   = $true
+    foreach ($profileDir in $Profiles) {
+        $accountId = Split-Path -Leaf $profileDir
+        $label     = if ($names.ContainsKey($accountId)) { "$($names[$accountId])  ($accountId)" } else { $accountId }
+        if ($byTitle.ContainsKey($label)) { $label = "$label  -  $profileDir" }
+        $options.Add((New-Object Playnite.SDK.MessageBoxOption($label, $first, $false)))
+        $byTitle[$label] = $profileDir
+        $first = $false
+    }
+    $options.Add((New-Object Playnite.SDK.MessageBoxOption('Cancel', $false, $true)))
+
+    $chosen = $PlayniteApi.Dialogs.ShowMessage(
+        'More than one Steam account was found on this machine. Which one should the non-Steam shortcuts be added to?',
+        'Non-Steam Shortcuts',
+        [System.Windows.MessageBoxImage]::Question,
+        $options)
+
+    if ($null -eq $chosen -or $chosen.IsCancel -or -not $byTitle.ContainsKey($chosen.Title)) { return $null }
+    return $byTitle[$chosen.Title]
 }
 
 function Set-SteamUserdataFolder
@@ -457,43 +572,63 @@ function Select-SteamUserdataFolder
         $saved = (Get-Content -LiteralPath $configPath -Raw -ErrorAction SilentlyContinue)
         if ($saved) { $saved = $saved.Trim() }
         if (Test-SteamUserdataDir $saved) { return $saved }
+
+        # An earlier version accepted any folder containing "config", so a saved
+        # Steam install root is possible. Repair it instead of nagging.
+        $repaired = Get-SteamProfilesUnder $saved
+        if ($repaired.Count -ge 1) {
+            $picked = Select-SteamProfileInteractively $repaired
+            if ($picked) {
+                Set-Content -LiteralPath $configPath -Value $picked -Encoding UTF8
+                $__logger.Info("Non-Steam: corrected the saved Steam folder from '$saved' to '$picked'")
+                return $picked
+            }
+            return $null
+        }
+        if (-not [string]::IsNullOrWhiteSpace($saved)) {
+            $__logger.Warn("Non-Steam: the saved Steam folder '$saved' is no longer usable, asking again")
+        }
     }
 
-    # Assigned directly: the function already returns a string[], and wrapping
-    # it in @() would produce a one-element array holding the array itself,
-    # which then renders as its type name instead of the paths.
     $candidates = Find-SteamUserdataDirs
 
-    if (-not $Force -and $candidates.Count -eq 1 -and (Test-SteamUserdataDir $candidates[0])) {
-        Set-Content -LiteralPath $configPath -Value $candidates[0] -Encoding UTF8
-        $__logger.Info("Non-Steam: auto-detected Steam userdata folder: $($candidates[0])")
-        return $candidates[0]
+    if (-not $Force -and $candidates.Count -ge 1) {
+        $picked = Select-SteamProfileInteractively $candidates
+        if ($picked) {
+            Set-Content -LiteralPath $configPath -Value $picked -Encoding UTF8
+            $__logger.Info("Non-Steam: using Steam profile $picked")
+            return $picked
+        }
+        return $null
     }
 
-    $message = 'Select your Steam profile''s userdata folder.' + [Environment]::NewLine + [Environment]::NewLine
+    $message = 'Select your Steam folder.' + [Environment]::NewLine + [Environment]::NewLine
+    $message += 'You can pick the Steam install folder itself (for example '
+    $message += 'C:\Program Files (x86)\Steam) and the right profile will be found inside it, '
+    $message += 'or pick a specific userdata\<id> profile folder.'
     if ($candidates.Count -gt 0) {
-        $message += 'Detected the following on this machine:' + [Environment]::NewLine
-        $message += ($candidates -join [Environment]::NewLine) + [Environment]::NewLine + [Environment]::NewLine
-        $message += 'Pick the one matching your Steam account in the next dialog.'
-    } else {
-        $message += 'It is usually at C:\Program Files (x86)\Steam\userdata\<your steam id>.'
+        $message += [Environment]::NewLine + [Environment]::NewLine + 'Detected on this machine:' + [Environment]::NewLine
+        $message += ($candidates -join [Environment]::NewLine)
     }
     $PlayniteApi.Dialogs.ShowMessage($message, 'Non-Steam Shortcuts')
 
     $folder = $PlayniteApi.Dialogs.SelectFolder()
-    if (Test-SteamUserdataDir $folder) {
-        Set-Content -LiteralPath $configPath -Value $folder -Encoding UTF8
-        return $folder
-    }
+    if ([string]::IsNullOrWhiteSpace($folder)) { return $null }
 
-    if (-not [string]::IsNullOrWhiteSpace($folder)) {
+    $profiles = Get-SteamProfilesUnder $folder
+    if ($profiles.Count -eq 0) {
         $PlayniteApi.Dialogs.ShowErrorMessage(
-            "That folder has no 'config' subfolder, so it is not a Steam userdata profile folder.",
+            "No Steam user profile was found in:`n$folder`n`nPick your Steam install folder, or a userdata\<id> folder inside it.",
             'Non-Steam Shortcuts')
+        return $null
     }
-    return $null
-}
 
+    $picked = Select-SteamProfileInteractively $profiles
+    if (-not $picked) { return $null }
+
+    Set-Content -LiteralPath $configPath -Value $picked -Encoding UTF8
+    return $picked
+}
 
 ###############################################################################
 # Playnite action resolution (Playnite 10 / SDK 6 game model)
