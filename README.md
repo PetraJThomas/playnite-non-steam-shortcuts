@@ -94,8 +94,11 @@ Steam tags.
         in a package, so the shortcut targets the executable directly and the
         overlay works. Most Game Pass PC games are in this group.
     *   Genuine UWP apps cannot be started by running their executable, so those
-        fall back to `explorer.exe shell:AppsFolder\<package>!<app>`. They launch,
-        but the overlay cannot attach and they are reported separately.
+        are shell-activated via `explorer.exe shell:AppsFolder\<package>!<app>`,
+        which is what the Xbox plugin itself does. They launch correctly. Steam
+        hands off to the launcher, which exits immediately, so playtime tracking
+        and the overlay may not follow; these are reported separately so you know
+        which ones they are.
 
 *   **Games must be installed.** A shortcut is a path to an executable, and
     until a game is installed there is nothing to point at. The resolved target

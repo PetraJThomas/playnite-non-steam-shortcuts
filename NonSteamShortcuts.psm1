@@ -760,9 +760,11 @@ function Resolve-MicrosoftStoreLaunch
         $__logger.Warn("Non-Steam: manifest executable not readable for $($Game.Name): $exePath")
     }
 
-    # Sandboxed UWP, or the executable could not be reached: shell-activate it
-    # the same way the Xbox plugin does. Steam will launch it, but explorer.exe
-    # exits immediately so the overlay cannot attach.
+    # A packaged UWP app, or the executable could not be reached. Windows will
+    # not launch a UWP executable directly, so shell-activate it the way the
+    # Xbox plugin does; this starts the game correctly. Steam hands off to
+    # explorer.exe, which exits immediately, so Steam may lose track of the
+    # process and the overlay may not follow it in.
     $shell = "shell:AppsFolder\$pfn!$appId"
     $__logger.Info("Non-Steam: falling back to shell activation for $($Game.Name): $shell")
     return @{
@@ -1489,8 +1491,10 @@ function Show-ResultMessage
         $errors = $true
     }
     if ($NoOverlayGames.Count -gt 0) {
-        $message += $nl + $nl + "Created $($NoOverlayGames.Count) shortcut(s) that launch through the Microsoft Store."
-        $message += ' Steam will start them, but because they are shell-activated the overlay will not attach:' + $nl
+        $message += $nl + $nl + "Created $($NoOverlayGames.Count) shortcut(s) for Microsoft Store apps."
+        $message += ' These are packaged UWP apps, which Windows will not start by running their executable,'
+        $message += ' so the shortcut shell-activates them instead. They launch fine. Steam hands off to the'
+        $message += ' launcher and that exits straight away, so playtime tracking and the overlay may not follow:' + $nl
         $message += Format-GameList $NoOverlayGames
         $errors = $true
     }
