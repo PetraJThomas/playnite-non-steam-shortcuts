@@ -556,9 +556,9 @@ function Set-SteamUserdataFolder
 {
     param($scriptMainMenuItemActionArgs)
 
-    $folder = Select-SteamUserdataFolder -Force
+    $folder = Get-SelectedSteamUserdataFolder -Force
     if ($folder) {
-        $PlayniteApi.Dialogs.ShowMessage("Steam userdata folder set to:`n$folder", 'Non-Steam Shortcuts')
+        [void]$PlayniteApi.Dialogs.ShowMessage("Steam userdata folder set to:`n$folder", 'Non-Steam Shortcuts')
     }
 }
 
@@ -610,14 +610,14 @@ function Select-SteamUserdataFolder
         $message += [Environment]::NewLine + [Environment]::NewLine + 'Detected on this machine:' + [Environment]::NewLine
         $message += ($candidates -join [Environment]::NewLine)
     }
-    $PlayniteApi.Dialogs.ShowMessage($message, 'Non-Steam Shortcuts')
+    [void]$PlayniteApi.Dialogs.ShowMessage($message, 'Non-Steam Shortcuts')
 
     $folder = $PlayniteApi.Dialogs.SelectFolder()
     if ([string]::IsNullOrWhiteSpace($folder)) { return $null }
 
     $profiles = Get-SteamProfilesUnder $folder
     if ($profiles.Count -eq 0) {
-        $PlayniteApi.Dialogs.ShowErrorMessage(
+        [void]$PlayniteApi.Dialogs.ShowErrorMessage(
             "No Steam user profile was found in:`n$folder`n`nPick your Steam install folder, or a userdata\<id> folder inside it.",
             'Non-Steam Shortcuts')
         return $null
@@ -628,6 +628,22 @@ function Select-SteamUserdataFolder
 
     Set-Content -LiteralPath $configPath -Value $picked -Encoding UTF8
     return $picked
+}
+
+function Get-SelectedSteamUserdataFolder
+{
+    <#
+        Select-SteamUserdataFolder talks to the user, and anything that leaks to
+        the pipeline in there would ride along with its return value. Collapse
+        the result to a single validated path, or $null.
+    #>
+    param([switch]$Force)
+
+    $result = @(Select-SteamUserdataFolder -Force:$Force)
+    foreach ($candidate in $result) {
+        if ($candidate -is [string] -and (Test-SteamUserdataDir $candidate)) { return $candidate }
+    }
+    return $null
 }
 
 ###############################################################################
@@ -1135,11 +1151,11 @@ function Invoke-NonSteamShortcuts
 
     $games = $scriptGameMenuItemActionArgs.Games
     if (-not $games -or $games.Count -eq 0) {
-        $PlayniteApi.Dialogs.ShowMessage('No games selected.', 'Non-Steam Shortcuts')
+        [void]$PlayniteApi.Dialogs.ShowMessage('No games selected.', 'Non-Steam Shortcuts')
         return
     }
 
-    $steamUserdata = Select-SteamUserdataFolder
+    $steamUserdata = Get-SelectedSteamUserdataFolder
     if (-not (Test-SteamUserdataDir $steamUserdata)) { return }
 
     if (Get-Process -Name 'steam' -ErrorAction SilentlyContinue) {
@@ -1168,13 +1184,13 @@ function Invoke-NonSteamShortcuts
         try {
             $backupPath = Backup-ShortcutsVdf $shortcutsVdf
         } catch {
-            $PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error backing up shortcuts.vdf')
+            [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error backing up shortcuts.vdf')
             return
         }
         try {
             $steamShortcuts = Read-ShortcutsVdf $shortcutsVdf
         } catch {
-            $PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error loading shortcuts.vdf')
+            [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error loading shortcuts.vdf')
             return
         }
     } else {
@@ -1338,13 +1354,13 @@ function Invoke-NonSteamShortcuts
     try {
         Write-ShortcutsVdf $shortcutsVdf $steamShortcuts
     } catch {
-        $PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error saving shortcuts.vdf')
+        [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error saving shortcuts.vdf')
         if ($backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
             try {
                 Copy-Item -LiteralPath $backupPath -Destination $shortcutsVdf -Force -ErrorAction Stop
-                $PlayniteApi.Dialogs.ShowMessage('Successfully restored the shortcuts.vdf backup.', 'Non-Steam Shortcuts')
+                [void]$PlayniteApi.Dialogs.ShowMessage('Successfully restored the shortcuts.vdf backup.', 'Non-Steam Shortcuts')
             } catch {
-                $PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error restoring shortcuts.vdf backup')
+                [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error restoring shortcuts.vdf backup')
             }
         }
         return
@@ -1498,6 +1514,6 @@ function Show-ResultMessage
             Invoke-Item (Join-Path $PlayniteApi.Paths.ConfigurationPath 'playnite.log')
         }
     } else {
-        $PlayniteApi.Dialogs.ShowMessage($message, 'Non-Steam Shortcuts')
+        [void]$PlayniteApi.Dialogs.ShowMessage($message, 'Non-Steam Shortcuts')
     }
 }
