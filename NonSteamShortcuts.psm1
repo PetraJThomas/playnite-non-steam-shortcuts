@@ -1106,6 +1106,23 @@ function Invoke-NonSteamShortcuts
             continue
         }
 
+        # A stale action can outlive the install, which would produce a shortcut
+        # pointing at a path that no longer exists. Verify before writing one.
+        if (-not $launch.IsUrl) {
+            $exeExists = $false
+            try { $exeExists = Test-Path -LiteralPath $launch.Exe -PathType Leaf } catch { }
+            if (-not $exeExists) {
+                if (-not $game.IsInstalled) {
+                    $__logger.Warn("Non-Steam: not installed, and its launch path is gone: $($game.Name)")
+                    $skippedNotInstalled.Add($game.Name)
+                    continue
+                }
+                # Marked installed but unreadable: could be ACLs or a drive that
+                # is offline rather than a genuinely bad path, so warn and go on.
+                $__logger.Warn("Non-Steam: launch path is not readable for $($game.Name), creating the shortcut anyway: $($launch.Exe)")
+            }
+        }
+
         if ($launch.IsUrl) {
             $__logger.Warn("Non-Steam: game launches via URL, Steam overlay will not work: $($game.Name)")
             $urlGames.Add($game.Name)
@@ -1306,6 +1323,7 @@ function Show-ResultMessage
     if ($SkippedNotInstalled.Count -gt 0) {
         $message += $nl + $nl + "Skipped $($SkippedNotInstalled.Count) game(s) that are not installed:" + $nl
         $message += Format-GameList $SkippedNotInstalled
+        $message += $nl + 'Install them, then run this again - a shortcut needs a real executable to point at.'
         $errors = $true
     }
     if ($SkippedNoAction.Count -gt 0) {
