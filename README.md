@@ -72,12 +72,24 @@ Playnite covers are usually already 600x900 — the shape SteamGridDB serves —
 if you use the SteamGridDB metadata plugin in Playnite, that art carries straight
 through to Steam.
 
-Nothing is invented when a game has no cover. Steam falls back to its own plain
-name tile, which looks better than a small package icon stretched to portrait
-shape. The results dialog lists any game that ended up without library
-artwork, so you can give it a cover in Playnite (Download Metadata, or a
-SteamGridDB metadata addon) and then run "replace Steam artwork" to push it
-across.
+### SteamGridDB fallback
+
+When Playnite has no cover for a game, the extension can pull fan-made art
+straight from [SteamGridDB](https://www.steamgriddb.com/). It fetches the
+600x900 grid, the hero and the logo, and writes them alongside everything else.
+
+It needs a free API key from
+<https://www.steamgriddb.com/profile/preferences/api>, set once via
+"Extensions" -> "Non-Steam Shortcuts" -> "Set SteamGridDB API key...". The key
+is checked against the API as you save it, so a bad one is caught there rather
+than failing quietly later. Clear the field to turn the fallback off again.
+
+Without a key nothing is fetched and nothing is invented: Steam keeps its own
+plain name tile. Either way the results dialog lists any game that still has no
+artwork, so you always know which ones are bare.
+
+Playnite's own art always wins. SteamGridDB is only consulted for slots that are
+still empty, unless you use "replace Steam artwork", which refreshes everything.
 
 Playnite **categories** are written to the shortcut's `tags`, so they show up as
 Steam tags.

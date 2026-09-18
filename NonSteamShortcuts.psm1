@@ -69,11 +69,17 @@ function GetMainMenuItems
 {
     param($getMainMenuItemsArgs)
 
-    $item = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
-    $item.Description  = 'Find Steam Install Folder'
-    $item.FunctionName = 'Set-SteamUserdataFolder'
-    $item.MenuSection  = '@Non-Steam Shortcuts'
-    return $item
+    $steamFolder = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
+    $steamFolder.Description  = 'Find Steam Install Folder'
+    $steamFolder.FunctionName = 'Set-SteamUserdataFolder'
+    $steamFolder.MenuSection  = '@Non-Steam Shortcuts'
+
+    $gridKey = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
+    $gridKey.Description  = 'Set SteamGridDB API key...'
+    $gridKey.FunctionName = 'Set-SteamGridDbApiKey'
+    $gridKey.MenuSection  = '@Non-Steam Shortcuts'
+
+    return @($steamFolder, $gridKey)
 }
 
 
@@ -1038,6 +1044,209 @@ function Complete-LaunchSpec
 
 
 ###############################################################################
+# SteamGridDB
+#
+# Used only as a fallback, for games Playnite has no cover for. Needs a free
+# API key from https://www.steamgriddb.com/profile/preferences/api, entered via
+# "Extensions" -> "Non-Steam Shortcuts" -> "Set SteamGridDB API key...".
+# Without a key nothing here runs and the game simply keeps Steam's plain tile.
+###############################################################################
+
+$script:SgdbApiBase   = 'https://www.steamgriddb.com/api/v2'
+$script:SgdbKeyLoaded = $false
+$script:SgdbKey       = $null
+$script:SgdbGameIds   = $null   # name -> game id, cached per run
+
+function Get-SteamGridDbKeyPath
+{
+    if (-not (Test-Path -LiteralPath $CurrentExtensionDataPath -PathType Container)) {
+        New-Item -ItemType Directory -Path $CurrentExtensionDataPath -Force | Out-Null
+    }
+    return (Join-Path $CurrentExtensionDataPath 'steamgriddb_api_key.txt')
+}
+
+function Get-SteamGridDbApiKey
+{
+    if ($script:SgdbKeyLoaded) { return $script:SgdbKey }
+    $script:SgdbKeyLoaded = $true
+
+    $path = Get-SteamGridDbKeyPath
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $key = (Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue)
+        if ($key) { $key = $key.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($key)) { $script:SgdbKey = $key }
+    }
+    return $script:SgdbKey
+}
+
+function Set-SteamGridDbApiKey
+{
+    param($scriptMainMenuItemActionArgs)
+
+    $existing = Get-SteamGridDbApiKey
+    if ($null -eq $existing) { $existing = '' }
+
+    $answer = $PlayniteApi.Dialogs.SelectString(
+        "Paste your SteamGridDB API key." + [Environment]::NewLine + [Environment]::NewLine +
+        "Get one free at https://www.steamgriddb.com/profile/preferences/api" + [Environment]::NewLine +
+        "Leave it empty to turn the SteamGridDB fallback off.",
+        'Non-Steam Shortcuts',
+        $existing)
+
+    if (-not $answer.Result) { return }
+
+    $key  = "$($answer.SelectedString)".Trim()
+    $path = Get-SteamGridDbKeyPath
+
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        $script:SgdbKey = $null
+        $script:SgdbKeyLoaded = $true
+        [void]$PlayniteApi.Dialogs.ShowMessage('SteamGridDB key cleared. Artwork will only come from Playnite.', 'Non-Steam Shortcuts')
+        return
+    }
+
+    Set-Content -LiteralPath $path -Value $key -Encoding UTF8
+    $script:SgdbKey = $key
+    $script:SgdbKeyLoaded = $true
+
+    # Prove the key works now rather than failing silently mid-run.
+    $test = Invoke-SteamGridDbApi "search/autocomplete/$([uri]::EscapeDataString('portal'))" $key
+    if ($null -eq $test) {
+        [void]$PlayniteApi.Dialogs.ShowErrorMessage(
+            'Saved, but SteamGridDB did not accept that key. Check it and try again.',
+            'Non-Steam Shortcuts')
+    } else {
+        [void]$PlayniteApi.Dialogs.ShowMessage('SteamGridDB key saved and working.', 'Non-Steam Shortcuts')
+    }
+}
+
+function Invoke-SteamGridDbApi
+{
+    <#
+        Returns the "data" payload, or $null on any failure. Artwork is a
+        nice-to-have, so nothing in here is allowed to break a run.
+    #>
+    param([string]$Path, [string]$Key)
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    } catch { }
+
+    try {
+        $response = Invoke-RestMethod -Uri "$script:SgdbApiBase/$Path" `
+                                      -Headers @{ Authorization = "Bearer $Key" } `
+                                      -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+        if ($response -and $response.success) { return $response.data }
+        return $null
+    } catch {
+        $__logger.Warn("Non-Steam: SteamGridDB request failed for '$Path': $($_.Exception.Message)")
+        return $null
+    }
+}
+
+function Find-SteamGridDbGameId
+{
+    param([string]$Name, [string]$Key)
+
+    if ($null -eq $script:SgdbGameIds) { $script:SgdbGameIds = @{} }
+    if ($script:SgdbGameIds.ContainsKey($Name)) { return $script:SgdbGameIds[$Name] }
+
+    $id = $null
+    $results = Invoke-SteamGridDbApi "search/autocomplete/$([uri]::EscapeDataString($Name))" $Key
+    if ($results) {
+        $first = @($results)[0]
+        if ($first -and $first.id) {
+            $id = $first.id
+            $__logger.Info("Non-Steam: SteamGridDB matched '$Name' to '$($first.name)' (id $id)")
+        }
+    }
+    if ($null -eq $id) {
+        $__logger.Info("Non-Steam: SteamGridDB has no match for '$Name'")
+    }
+    $script:SgdbGameIds[$Name] = $id
+    return $id
+}
+
+function Save-SteamGridDbAsset
+{
+    <#
+        Fetch one artwork kind and write it next to the other grid files.
+        Returns $true if a file was written.
+    #>
+    param(
+        [string]$GridDir,
+        [long]$AppId,
+        [int]$GameId,
+        [string]$Kind,      # grids | heroes | logos
+        [string]$Suffix,    # p | _hero | _logo
+        [string]$Query,
+        [string]$Key
+    )
+
+    $path = "$Kind/game/$GameId"
+    if ($Query) { $path += "?$Query" }
+
+    $assets = Invoke-SteamGridDbApi $path $Key
+    if (-not $assets) { return $false }
+
+    $asset = @($assets)[0]
+    if (-not $asset -or [string]::IsNullOrWhiteSpace($asset.url)) { return $false }
+
+    $extension = [System.IO.Path]::GetExtension(($asset.url -split '\?')[0])
+    if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '.png' }
+
+    # Clear other extensions for this slot so a stale file cannot win.
+    foreach ($old in @(Get-ChildItem -LiteralPath $GridDir -Filter "$AppId$Suffix.*" -File -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
+    }
+
+    $destination = Join-Path $GridDir "$AppId$Suffix$extension"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $asset.url -OutFile $destination -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        $__logger.Info("Non-Steam: SteamGridDB supplied $Kind artwork for app $AppId")
+        return $true
+    } catch {
+        $__logger.Warn("Non-Steam: could not download $Kind artwork for app $AppId : $($_.Exception.Message)")
+        return $false
+    }
+}
+
+function Copy-SteamGridDbArt
+{
+    <#
+        Fallback artwork for a game Playnite has no cover for. Only fills slots
+        that are still empty unless -Overwrite is given. Returns how many files
+        were written.
+    #>
+    param([string]$GridDir, [long]$AppId, [string]$Name, [switch]$Overwrite)
+
+    $key = Get-SteamGridDbApiKey
+    if ([string]::IsNullOrWhiteSpace($key)) { return 0 }
+
+    $gameId = Find-SteamGridDbGameId $Name $key
+    if (-not $gameId) { return 0 }
+
+    $wanted = @(
+        @{ Kind = 'grids';  Suffix = 'p';     Query = 'dimensions=600x900' },
+        @{ Kind = 'heroes'; Suffix = '_hero'; Query = '' },
+        @{ Kind = 'logos';  Suffix = '_logo'; Query = '' }
+    )
+
+    $written = 0
+    foreach ($slot in $wanted) {
+        $existing = @(Get-ChildItem -LiteralPath $GridDir -Filter "$AppId$($slot.Suffix).*" -File -ErrorAction SilentlyContinue)
+        if ($existing.Count -gt 0 -and -not $Overwrite) { continue }
+
+        if (Save-SteamGridDbAsset $GridDir $AppId $gameId $slot.Kind $slot.Suffix $slot.Query $key) {
+            $written++
+        }
+    }
+    return $written
+}
+
+###############################################################################
 # Tags and grid artwork
 ###############################################################################
 
@@ -1344,8 +1553,14 @@ function Invoke-NonSteamShortcuts
         # capsule. That is usually because Playnite has no cover for the
         # game, which is worth saying rather than leaving to be noticed.
         $portrait = @(Get-ChildItem -LiteralPath $gridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
+        if ($portrait.Count -eq 0 -or $ReplaceArt) {
+            # Playnite had nothing to copy (or we were told to replace), so try
+            # SteamGridDB. Does nothing unless an API key has been set.
+            $artCopied += Copy-SteamGridDbArt $gridDir $appId $game.Name -Overwrite:$ReplaceArt
+            $portrait = @(Get-ChildItem -LiteralPath $gridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
+        }
         if ($portrait.Count -eq 0) {
-            $__logger.Info("Non-Steam: no library artwork for $($game.Name); Playnite has no cover to copy")
+            $__logger.Info("Non-Steam: no library artwork for $($game.Name)")
             $noArtworkGames.Add($game.Name)
         }
 
@@ -1506,10 +1721,15 @@ function Show-ResultMessage
         $errors = $true
     }
     if ($NoArtworkGames.Count -gt 0) {
-        $message += $nl + $nl + "$($NoArtworkGames.Count) game(s) have no library artwork in Steam, because Playnite"
-        $message += ' has no cover image for them. Steam shows a plain name tile instead. Give them a cover in'
-        $message += ' Playnite (Download Metadata, or a SteamGridDB metadata addon) and run the "replace Steam'
-        $message += ' artwork" menu entry to push it across:' + $nl
+        $message += $nl + $nl + "$($NoArtworkGames.Count) game(s) have no library artwork in Steam."
+        if ([string]::IsNullOrWhiteSpace((Get-SteamGridDbApiKey))) {
+            $message += ' Playnite has no cover for them and no SteamGridDB key is set, so there was nothing'
+            $message += ' to copy. Set a key under "Extensions" -> "Non-Steam Shortcuts" -> "Set SteamGridDB'
+            $message += ' API key..." to pull fan-made art automatically, or give them a cover in Playnite:' + $nl
+        } else {
+            $message += ' Neither Playnite nor SteamGridDB had anything for them, so Steam shows a plain name'
+            $message += ' tile. Giving them a cover in Playnite and running "replace Steam artwork" will fix it:' + $nl
+        }
         $message += Format-GameList $NoArtworkGames
     }
     if ($NoOverlayGames.Count -gt 0) {
