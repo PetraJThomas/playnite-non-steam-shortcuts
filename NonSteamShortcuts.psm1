@@ -58,17 +58,27 @@ function GetGameMenuItems
     $create.FunctionName = 'Add-NonSteamShortcuts'
     $create.MenuSection  = '@Non-Steam Shortcuts'
 
-    $replace = New-Object Playnite.SDK.Plugins.ScriptGameMenuItem
-    $replace.Description  = 'Create non-Steam shortcuts (replace Steam artwork)'
-    $replace.FunctionName = 'Add-NonSteamShortcutsReplacingArt'
-    $replace.MenuSection  = '@Non-Steam Shortcuts'
+    # The "from Playnite" pair exists because SteamGridDB matches on the game's
+    # name and sometimes gets it wrong - it once answered "Farm Frenzy 3: Ice
+    # Age" for "Ice Age 3(TM)". Curating the artwork in Playnite and pushing
+    # that across is the way to overrule it, so these two never ask SteamGridDB
+    # at all.
+    $curated = New-Object Playnite.SDK.Plugins.ScriptGameMenuItem
+    $curated.Description  = 'Create non-Steam shortcuts (use Playnite artwork, replacing Steam''s)'
+    $curated.FunctionName = 'Add-NonSteamShortcutsFromPlaynite'
+    $curated.MenuSection  = '@Non-Steam Shortcuts'
 
     $rebuild = New-Object Playnite.SDK.Plugins.ScriptGameMenuItem
     $rebuild.Description  = 'Replace ALL non-Steam shortcuts with the selected games'
     $rebuild.FunctionName = 'Reset-NonSteamShortcuts'
     $rebuild.MenuSection  = '@Non-Steam Shortcuts'
 
-    return @($create, $replace, $rebuild)
+    $rebuildCurated = New-Object Playnite.SDK.Plugins.ScriptGameMenuItem
+    $rebuildCurated.Description  = 'Replace ALL non-Steam shortcuts with the selected games (use Playnite artwork)'
+    $rebuildCurated.FunctionName = 'Reset-NonSteamShortcutsFromPlaynite'
+    $rebuildCurated.MenuSection  = '@Non-Steam Shortcuts'
+
+    return @($create, $curated, $rebuild, $rebuildCurated)
 }
 
 function GetMainMenuItems
@@ -2090,11 +2100,17 @@ function Add-NonSteamShortcuts
     Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs
 }
 
-function Add-NonSteamShortcutsReplacingArt
+function Add-NonSteamShortcutsFromPlaynite
 {
+    <#
+        Push what Playnite has over whatever Steam is showing, and do not ask
+        SteamGridDB for anything. This is the answer to a bad SteamGridDB
+        match: fix the game's artwork in Playnite, run this, and Steam gets
+        exactly that.
+    #>
     param($scriptGameMenuItemActionArgs)
 
-    Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt
+    Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt -PlayniteArtOnly
 }
 
 function Reset-NonSteamShortcuts
@@ -2110,6 +2126,17 @@ function Reset-NonSteamShortcuts
     param($scriptGameMenuItemActionArgs)
 
     Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt -ReplaceAll
+}
+
+function Reset-NonSteamShortcutsFromPlaynite
+{
+    <#
+        The rebuild, with artwork taken only from Playnite. Same reasoning as
+        Add-NonSteamShortcutsFromPlaynite.
+    #>
+    param($scriptGameMenuItemActionArgs)
+
+    Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt -ReplaceAll -PlayniteArtOnly
 }
 
 ###############################################################################
@@ -2493,7 +2520,7 @@ function Invoke-ShortcutBuild
         $Progress is a progress window from New-ProgressWindow, or $null to run
         without any UI at all.
     #>
-    param($Games, [string]$GridDir, $SteamShortcuts, [switch]$ReplaceArt, $Progress)
+    param($Games, [string]$GridDir, $SteamShortcuts, [switch]$ReplaceArt, [switch]$PlayniteArtOnly, $Progress)
 
     $cancelled = $false
     $gamesUpdated        = 0
@@ -2684,9 +2711,12 @@ function Invoke-ShortcutBuild
             # capsule. That is usually because Playnite has no cover for the
             # game, which is worth saying rather than leaving to be noticed.
             $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
-            if ($portrait.Count -eq 0 -or $ReplaceArt) {
+            if (-not $PlayniteArtOnly -and ($portrait.Count -eq 0 -or $ReplaceArt)) {
                 # Playnite had nothing to copy (or we were told to replace), so
                 # try SteamGridDB. Does nothing unless an API key has been set.
+                # Skipped entirely when the caller asked for Playnite's artwork:
+                # SteamGridDB matches on the name and can pick the wrong game,
+                # which is the very thing that menu entry exists to overrule.
                 $artCopied += Copy-SteamGridDbArt $GridDir $appId $game.Name -Overwrite:$ReplaceArt -Progress $Progress
                 $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
             }
@@ -2773,7 +2803,7 @@ function Invoke-ShortcutBuild
 
 function Invoke-NonSteamShortcuts
 {
-    param($scriptGameMenuItemActionArgs, [switch]$ReplaceArt, [switch]$ReplaceAll)
+    param($scriptGameMenuItemActionArgs, [switch]$ReplaceArt, [switch]$ReplaceAll, [switch]$PlayniteArtOnly)
 
     $games = $scriptGameMenuItemActionArgs.Games
     if (-not $games -or $games.Count -eq 0) {
@@ -2851,7 +2881,7 @@ function Invoke-NonSteamShortcuts
     try {
         $build = Invoke-ShortcutBuild `
             -Games $games -GridDir $gridDir -SteamShortcuts $steamShortcuts `
-            -ReplaceArt:$ReplaceArt -Progress $progressWindow
+            -ReplaceArt:$ReplaceArt -PlayniteArtOnly:$PlayniteArtOnly -Progress $progressWindow
 
         # A cancelled run leaves shortcuts.vdf alone, so there is nothing to
         # save and nothing to undo.
@@ -2924,7 +2954,7 @@ function Invoke-NonSteamShortcuts
             -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
             -SkippedForeign $build.SkippedForeign `
             -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
-            -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames -NothingWritten
+            -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames -PlayniteArtOnly:$PlayniteArtOnly -NothingWritten
         return
     }
 
@@ -2933,7 +2963,7 @@ function Invoke-NonSteamShortcuts
         -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
             -SkippedForeign $build.SkippedForeign `
         -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
-        -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames `
+        -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames -PlayniteArtOnly:$PlayniteArtOnly `
         -UpdateFailed $updateFailed
 }
 
@@ -3043,6 +3073,7 @@ function Show-ResultMessage
         $UrlGames,
         $SkippedForeign,
         $UpdateFailed,
+        [switch]$PlayniteArtOnly,
         [switch]$NothingWritten
     )
 
@@ -3110,13 +3141,19 @@ function Show-ResultMessage
     }
     if ($NoArtworkGames.Count -gt 0) {
         $message += $nl + $nl + "$($NoArtworkGames.Count) game(s) have no library artwork in Steam."
-        if ([string]::IsNullOrWhiteSpace((Get-SteamGridDbApiKey))) {
+        if ($PlayniteArtOnly) {
+            # SteamGridDB was skipped on purpose here, so suggesting a key
+            # would be beside the point.
+            $message += ' You asked for Playnite''s artwork, and Playnite has no cover for these, so Steam'
+            $message += ' shows a plain name tile. Give them a cover in Playnite and run this again:' + $nl
+        }
+        elseif ([string]::IsNullOrWhiteSpace((Get-SteamGridDbApiKey))) {
             $message += ' Playnite has no cover for them and no SteamGridDB key is set, so there was nothing'
             $message += ' to copy. Set a key under "Extensions" -> "Non-Steam Shortcuts" -> "Set SteamGridDB'
             $message += ' API key..." to pull fan-made art automatically, or give them a cover in Playnite:' + $nl
         } else {
             $message += ' Neither Playnite nor SteamGridDB had anything for them, so Steam shows a plain name'
-            $message += ' tile. Giving them a cover in Playnite and running "replace Steam artwork" will fix it:' + $nl
+            $message += ' tile. Give them a cover in Playnite and run "use Playnite artwork" to push it across:' + $nl
         }
         $message += Format-GameList $NoArtworkGames
     }
