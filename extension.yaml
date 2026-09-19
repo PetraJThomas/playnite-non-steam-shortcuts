@@ -1,6 +1,11 @@
-Id: bburky-playnite-non-steam-shortcuts
+Id: petrajthomas-playnite-non-steam-shortcuts
 Name: Non-Steam Shortcuts
-Author: Blake Burkhart
-Version: 0.3.0
+Author: Petra Thomas
+Version: 1.0.0
 Module: NonSteamShortcuts.psm1
 Type: Script
+Links:
+  - Name: Source
+    Url: https://github.com/PetraJThomas/playnite-non-steam-shortcuts
+  - Name: Report an issue
+    Url: https://github.com/PetraJThomas/playnite-non-steam-shortcuts/issues

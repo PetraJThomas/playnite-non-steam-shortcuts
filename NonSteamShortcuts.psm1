@@ -274,6 +274,26 @@ function Read-ShortcutsVdf
     return ,$entries
 }
 
+function Find-OwnedShortcutEntry
+{
+    <#
+        The entry this extension already created for a particular Playnite
+        game, found by the identity stamped into it rather than by its name.
+
+        Matching on the name alone was wrong twice over: renaming a game in
+        Playnite left the old shortcut orphaned in Steam forever and added a
+        second one, and a shortcut someone else had made under the same name -
+        EmuDeck, Steam ROM Manager, or by hand - was silently overwritten.
+    #>
+    param($Entries, [string]$GameId, $Owned)
+
+    if ([string]::IsNullOrWhiteSpace($GameId)) { return $null }
+    foreach ($entry in $Entries) {
+        if ((Get-ShortcutOwnerId $entry $Owned) -eq $GameId) { return $entry }
+    }
+    return $null
+}
+
 function Find-ShortcutEntry
 {
     # Steam compares AppNames case insensitively; first match wins.
@@ -315,6 +335,14 @@ function Write-VdfMap
             Write-VdfCString $Stream $k
             Write-VdfCString $Stream $v
         }
+        elseif ($null -eq $v) {
+            # Without this a $null falls into the integer branch below and is
+            # written as a type-0x02 field holding 0, so a string key such as
+            # 'icon' comes back as a number and Steam can reject the file.
+            $Stream.WriteByte(0x01)
+            Write-VdfCString $Stream $k
+            Write-VdfCString $Stream ''
+        }
         else {
             if ($v -is [bool]) { $v = [int]$v }
             $Stream.WriteByte(0x02)
@@ -351,6 +379,10 @@ function Write-ShortcutsVdf
             $stream.WriteByte(0x08)
         }
         finally {
+            # Push the bytes to the disk before the file is swapped in. Dispose
+            # alone only reaches the OS cache, so a power loss moments after a
+            # run could commit the rename onto an empty file.
+            try { $stream.Flush($true) } catch { }
             $stream.Dispose()
         }
 
@@ -375,13 +407,43 @@ function Backup-ShortcutsVdf
     # up the damage done by the first and the pristine file is gone.
     param([string]$Path)
 
-    $backupPath = '{0}.{1}.bak' -f $Path, (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $directory = Split-Path -Parent $Path
+    $leaf      = Split-Path -Leaf $Path
+
+    # Milliseconds, so two runs in the same second get separate backups AND the
+    # fixed-width stamp still sorts lexically by age. A '-2' style suffix would
+    # not: '-9' sorts after '-12'.
+    $backupPath = '{0}.{1}.bak' -f $Path, (Get-Date -Format 'yyyyMMdd-HHmmssfff')
+    $suffix = 1
+    while (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+        $backupPath = '{0}.{1}-{2:D2}.bak' -f $Path, (Get-Date -Format 'yyyyMMdd-HHmmssfff'), $suffix
+        $suffix++
+    }
     Copy-Item -LiteralPath $Path -Destination $backupPath -Force -ErrorAction Stop
 
-    $old = @(Get-ChildItem -LiteralPath (Split-Path -Parent $Path) -Filter '*.bak' -File -ErrorAction SilentlyContinue |
-             Sort-Object LastWriteTime -Descending | Select-Object -Skip $script:BackupsToKeep)
-    foreach ($f in $old) {
-        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    # Prune on the timestamp in the NAME, not LastWriteTime. Copy-Item carries
+    # the source's timestamp over, so every backup of a file this extension has
+    # rewritten looks newer than the pristine one taken before it ever ran -
+    # which made the oldest and most valuable backup the first to be deleted.
+    #
+    # The name is matched with a regex rather than -Filter because Win32
+    # wildcards treat '*.bak' as matching '.bakery' too.
+    # \d{3} is optional so backups written by earlier versions, which stamped
+    # only to the second, are still recognised, counted and pruned.
+    $pattern = '^' + [regex]::Escape($leaf) + '\.\d{8}-\d{6}(\d{3})?(-\d+)?\.bak$'
+    # Oldest first: the stamp is fixed width, so the name sorts by age.
+    $ours = @(Get-ChildItem -LiteralPath $directory -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match $pattern } |
+              Sort-Object -Property Name)
+    if ($ours.Count -gt $script:BackupsToKeep) {
+        # The very first backup is the only copy of shortcuts.vdf as it was
+        # before this extension ever touched it, which is exactly what someone
+        # undoing a "replace ALL" needs. Keep it permanently and thin the
+        # middle instead.
+        $doomed = $ours[1..($ours.Count - $script:BackupsToKeep)]
+        foreach ($f in $doomed) {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+        }
     }
     return $backupPath
 }
@@ -390,6 +452,21 @@ function Backup-ShortcutsVdf
 ###############################################################################
 # Steam userdata folder discovery
 ###############################################################################
+
+function Join-PathSafe
+{
+    # Join-Path throws on a path whose drive no longer exists, which is the
+    # normal state of affairs when Steam lives on an external disk that is
+    # unplugged. Callers here want an answer, not an exception.
+    param([string]$Path, [string]$ChildPath)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    try {
+        return [System.IO.Path]::Combine($Path, $ChildPath)
+    } catch {
+        return $null
+    }
+}
 
 function Test-SteamUserdataDir
 {
@@ -402,7 +479,9 @@ function Test-SteamUserdataDir
     param([string]$Folder)
 
     if ([string]::IsNullOrWhiteSpace($Folder)) { return $false }
-    if (-not (Test-Path -LiteralPath (Join-Path $Folder 'config') -PathType Container)) { return $false }
+    $config = Join-PathSafe $Folder 'config'
+    if (-not $config) { return $false }
+    if (-not (Test-Path -LiteralPath $config -PathType Container)) { return $false }
 
     try {
         $leaf   = Split-Path -Leaf $Folder
@@ -415,6 +494,7 @@ function Test-SteamUserdataDir
 
 function Get-SteamUserdataConfigPath
 {
+    Restore-LegacyExtensionData
     if (-not (Test-Path -LiteralPath $CurrentExtensionDataPath -PathType Container)) {
         New-Item -ItemType Directory -Path $CurrentExtensionDataPath -Force | Out-Null
     }
@@ -494,10 +574,14 @@ function Get-SteamProfilesUnder
 
     # A userdata folder, or a Steam root containing one
     $userdata = $Path
-    if ((Split-Path -Leaf $Path) -ne 'userdata') {
-        $userdata = Join-Path $Path 'userdata'
+    try {
+        if ((Split-Path -Leaf $Path) -ne 'userdata') {
+            $userdata = Join-PathSafe $Path 'userdata'
+        }
+    } catch {
+        return ,([string[]]@())
     }
-    if (-not (Test-Path -LiteralPath $userdata -PathType Container)) {
+    if (-not $userdata -or -not (Test-Path -LiteralPath $userdata -PathType Container)) {
         return ,([string[]]@())
     }
 
@@ -1176,6 +1260,7 @@ $script:SgdbEntropy = [System.Text.Encoding]::UTF8.GetBytes('NonSteamShortcuts.S
 
 function Get-SteamGridDbKeyPath
 {
+    Restore-LegacyExtensionData
     if (-not (Test-Path -LiteralPath $CurrentExtensionDataPath -PathType Container)) {
         New-Item -ItemType Directory -Path $CurrentExtensionDataPath -Force | Out-Null
     }
@@ -1289,6 +1374,9 @@ function Set-SteamGridDbApiKey
         return
     }
 
+    # Kept only once it is known to work: a rejected key left in place made
+    # every later run fail silently, and the summary then blamed a missing key.
+    $previous = Get-SteamGridDbApiKey
     Save-SteamGridDbApiKey $key
 
     # Prove the key works now rather than failing silently mid-run. It is one
@@ -1306,8 +1394,15 @@ function Set-SteamGridDbApiKey
         Close-ProgressWindow $checking
     }
     if ($null -eq $test) {
+        # Put back whatever was there before rather than leaving a key that is
+        # known not to work.
+        if ([string]::IsNullOrWhiteSpace($previous)) {
+            Remove-SteamGridDbApiKey
+        } else {
+            Save-SteamGridDbApiKey $previous
+        }
         [void]$PlayniteApi.Dialogs.ShowErrorMessage(
-            'Saved, but SteamGridDB did not accept that key. Check it and try again.',
+            'SteamGridDB did not accept that key, so it has not been kept. Check it and try again.',
             'Non-Steam Shortcuts')
     } else {
         [void]$PlayniteApi.Dialogs.ShowMessage(
@@ -1414,19 +1509,35 @@ function Save-SteamGridDbAsset
     $extension = [System.IO.Path]::GetExtension(($asset.url -split '\?')[0])
     if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '.png' }
 
-    # Clear other extensions for this slot so a stale file cannot win.
-    foreach ($old in @(Get-ChildItem -LiteralPath $GridDir -Filter "$AppId$Suffix.*" -File -ErrorAction SilentlyContinue)) {
-        Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
-    }
-
+    # Download beside the target first. Replacing the existing artwork before
+    # knowing the download works would destroy good art whenever the network
+    # drops mid-run, which is exactly when -Overwrite is most likely in use.
+    # The temporary name deliberately does not start with the app id, so the
+    # cleanup filter below cannot match it.
     $destination = Join-Path $GridDir "$AppId$Suffix$extension"
+    $temporary   = Join-Path $GridDir ("nss_download_" + [guid]::NewGuid().ToString('N') + $extension)
+
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $asset.url -OutFile $destination -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        Invoke-WebRequest -Uri $asset.url -OutFile $temporary -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+    } catch {
+        $__logger.Warn("Non-Steam: could not download $Kind artwork for app $AppId : $($_.Exception.Message)")
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    try {
+        # Only now: clear other extensions for this slot so a stale file cannot
+        # win, then move the finished download into place.
+        foreach ($old in @(Get-ChildItem -LiteralPath $GridDir -Filter "$AppId$Suffix.*" -File -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
+        }
+        Move-Item -LiteralPath $temporary -Destination $destination -Force -ErrorAction Stop
         $__logger.Info("Non-Steam: SteamGridDB supplied $Kind artwork for app $AppId")
         return $true
     } catch {
-        $__logger.Warn("Non-Steam: could not download $Kind artwork for app $AppId : $($_.Exception.Message)")
+        $__logger.Warn("Non-Steam: could not save $Kind artwork for app $AppId : $($_.Exception.Message)")
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
         return $false
     }
 }
@@ -1482,7 +1593,8 @@ function Merge-SteamTags
     #>
     param($Shortcut, $Game)
 
-    $tags = $Shortcut['tags']
+    $tags = $null
+    if ($Shortcut) { $tags = $Shortcut['tags'] }
     if (-not ($tags -is [System.Collections.IDictionary])) { $tags = [ordered]@{} }
 
     if (-not $Game.Categories) { return ,$tags }
@@ -1587,6 +1699,53 @@ function Copy-SteamGridArt
 # another tool, are not ours to remove.
 ###############################################################################
 
+$script:LegacyDataFolder = 'bburky-playnite-non-steam-shortcuts'
+$script:DataMigrationDone = $false
+
+function Restore-LegacyExtensionData
+{
+    <#
+        This started life under the upstream extension id, and Playnite names
+        the data folder after that id. Changing it to our own would otherwise
+        orphan the saved SteamGridDB key, the chosen Steam profile and the
+        record of which Steam shortcuts belong to us - the last of which is
+        what stops a cleanup deleting somebody else's shortcuts.
+
+        Copies rather than moves, so downgrading keeps working, and never
+        overwrites a file the new location already has.
+    #>
+    if ($script:DataMigrationDone) { return }
+    $script:DataMigrationDone = $true
+
+    try {
+        $parent = Split-Path -Parent $CurrentExtensionDataPath
+        if ([string]::IsNullOrWhiteSpace($parent)) { return }
+        $legacy = Join-PathSafe $parent $script:LegacyDataFolder
+        if (-not $legacy -or -not (Test-Path -LiteralPath $legacy -PathType Container)) { return }
+        if ([System.IO.Path]::GetFullPath($legacy) -eq [System.IO.Path]::GetFullPath($CurrentExtensionDataPath)) { return }
+
+        if (-not (Test-Path -LiteralPath $CurrentExtensionDataPath -PathType Container)) {
+            New-Item -ItemType Directory -Path $CurrentExtensionDataPath -Force | Out-Null
+        }
+
+        foreach ($name in @('owned_shortcuts.json', 'steam_userdata_path.txt', 'steamgriddb_api_key.dat')) {
+            $from = Join-PathSafe $legacy $name
+            $to   = Join-PathSafe $CurrentExtensionDataPath $name
+            if (-not $from -or -not $to) { continue }
+            if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { continue }
+            if (Test-Path -LiteralPath $to -PathType Leaf) { continue }
+            try {
+                Copy-Item -LiteralPath $from -Destination $to -ErrorAction Stop
+                $__logger.Info("Non-Steam: carried $name over from the previous extension id")
+            } catch {
+                $__logger.Warn("Non-Steam: could not carry $name over: $($_.Exception.Message)")
+            }
+        }
+    } catch {
+        $__logger.Warn("Non-Steam: could not check for earlier extension data: $($_.Exception.Message)")
+    }
+}
+
 function Get-OwnedShortcutsPath
 {
     if (-not (Test-Path -LiteralPath $CurrentExtensionDataPath -PathType Container)) {
@@ -1598,6 +1757,7 @@ function Get-OwnedShortcutsPath
 function Get-OwnedShortcuts
 {
     # appid (as a string) -> Playnite game id
+    Restore-LegacyExtensionData
     $path = Get-OwnedShortcutsPath
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{} }
 
@@ -1624,15 +1784,6 @@ function Save-OwnedShortcuts
     } catch {
         $__logger.Warn("Non-Steam: could not save the owned shortcut record: $($_.Exception.Message)")
     }
-}
-
-function Register-OwnedShortcut
-{
-    param([long]$AppId, [string]$GameId)
-
-    $owned = Get-OwnedShortcuts
-    $owned["$AppId"] = $GameId
-    Save-OwnedShortcuts $owned
 }
 
 function Get-ShortcutOwnerId
@@ -1799,8 +1950,9 @@ function Sync-NonSteamShortcuts
         if ($running -ne [System.Windows.MessageBoxResult]::Yes) { return }
     }
 
+    $backupPath = $null
     try {
-        [void](Backup-ShortcutsVdf $shortcutsVdf)
+        $backupPath = Backup-ShortcutsVdf $shortcutsVdf
     } catch {
         [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error backing up shortcuts.vdf')
         return
@@ -1810,9 +1962,17 @@ function Sync-NonSteamShortcuts
     # is slow enough to need telling about.
     $progressWindow = New-ProgressWindow -Headline 'Removing shortcuts' -Maximum $stale.Count
     $artRemoved = 0
+    $dropped    = New-Object 'System.Collections.Generic.List[object]'
     try {
         $removed = 0
         foreach ($entry in $stale) {
+            # Cancelling has to mean something here: the artwork is already
+            # gone for everything processed so far, so the rest is kept
+            # intact rather than deleted anyway.
+            if ($progressWindow -and $progressWindow.Cancelled) {
+                $__logger.Info('Non-Steam: cleanup cancelled by the user')
+                break
+            }
             if ($progressWindow) {
                 $progressWindow.Step(
                     "Removing shortcuts   ($($removed + 1) of $($stale.Count))",
@@ -1824,16 +1984,36 @@ function Sync-NonSteamShortcuts
                 $appId = ConvertTo-UnsignedAppId ([long]$entry['appid'])
                 $artRemoved += Remove-SteamGridArt $gridDir $appId
             }
+            $dropped.Add($entry)
         }
     }
     finally {
         Close-ProgressWindow $progressWindow
     }
 
+    # Whatever was not reached stays in the file.
+    $cancelledEarly = $dropped.Count -lt $stale.Count
+    if ($cancelledEarly) {
+        foreach ($entry in $stale) {
+            if (-not $dropped.Contains($entry)) { $keep.Add($entry) }
+        }
+    }
+    $stale = $dropped
+
     try {
         Write-ShortcutsVdf $shortcutsVdf $keep
     } catch {
         [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error saving shortcuts.vdf')
+        if ($backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+            try {
+                Copy-Item -LiteralPath $backupPath -Destination $shortcutsVdf -Force -ErrorAction Stop
+                [void]$PlayniteApi.Dialogs.ShowMessage(
+                    'Successfully restored the shortcuts.vdf backup. Artwork for the shortcuts being removed has already been deleted, so run this again once the problem is fixed.',
+                    'Non-Steam Shortcuts')
+            } catch {
+                [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error restoring shortcuts.vdf backup')
+            }
+        }
         return
     }
 
@@ -1847,6 +2027,9 @@ function Sync-NonSteamShortcuts
     Save-OwnedShortcuts $owned
 
     $result  = "Removed $($stale.Count) shortcut(s) and $artRemoved artwork file(s)." + $nl + $nl
+    if ($cancelledEarly) {
+        $result = "Cancelled." + $nl + $nl + $result
+    }
     $result += "$($keep.Count) shortcut(s) left in Steam."
     $result += $nl + $nl + 'Relaunch Steam to see the change.'
     [void]$PlayniteApi.Dialogs.ShowMessage($result, 'Non-Steam Shortcuts')
@@ -1955,18 +2138,37 @@ using System.Windows.Threading;
 
 public class NonSteamShortcutsProgress
 {
+    // Playnite's main window is disabled while a run is in progress, and more
+    // than one window can be open at once if anything re-enters. Counting is
+    // used rather than each window remembering the owner's previous state,
+    // because the second window would remember "disabled" and restore that.
+    private static int _disableDepth;
+
     private Window _win;
     private Window _owner;
     private TextBlock _headline;
     private TextBlock _detail;
     private ProgressBar _bar;
     private Button _cancel;
-    private bool _ownerWasEnabled;
+    private bool _disabledOwner;
 
     public bool Cancelled;
     public bool IsOpen { get { return _win != null; } }
 
     public void Start(string headline, double max, Window owner)
+    {
+        try {
+            Build(headline, max, owner);
+        } catch {
+            // Never leave Playnite disabled or a half-built window on screen
+            // because of a failure in here. The caller only learns that it has
+            // no progress window, which every caller already copes with.
+            Finish();
+            throw;
+        }
+    }
+
+    private void Build(string headline, double max, Window owner)
     {
         _owner = owner;
 
@@ -2021,31 +2223,88 @@ public class NonSteamShortcutsProgress
         } else {
             _win.WindowStartupLocation = WindowStartupLocation.CenterScreen;
         }
-        // Closing the window with its X means the same thing as cancelling.
         _win.Closing += OnClosing;
+        _win.Closed  += OnClosed;
 
         ApplyTheme();
         _win.Show();
 
-        // Keep Playnite itself from taking input while we work, which is what
-        // a modal dialog would do. Our own window stays live so Cancel works.
+        // Keep Playnite itself from taking input while we work, which is what a
+        // modal dialog would do. Our own window stays live so Cancel works.
+        //
+        // This disables the WPF element tree, not the Win32 window: the title
+        // bar stays live and Playnite can still be closed from it. That is why
+        // the owner's own Closing is watched too, so a run stops instead of
+        // carrying on writing while the app tears down.
         if (_owner != null) {
-            _ownerWasEnabled = _owner.IsEnabled;
-            _owner.IsEnabled = false;
+            if (_disableDepth == 0) { _owner.IsEnabled = false; }
+            _disableDepth++;
+            _disabledOwner = true;
+            _owner.Closing += OnOwnerClosing;
+            _owner.Closed  += OnOwnerClosed;
         }
         Pump();
     }
 
     private void OnCancel(object sender, RoutedEventArgs e)
     {
-        Cancelled = true;
-        _cancel.IsEnabled = false;
-        _headline.Text = "Stopping after the game in progress...";
+        RequestCancel("Stopping after the game in progress...");
     }
 
     private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
     {
+        // Closing the window means the same thing as pressing Cancel. The close
+        // is allowed to go ahead, and Finish (via OnClosed) puts Playnite back
+        // rather than leaving it disabled behind an empty screen.
         Cancelled = true;
+    }
+
+    private void OnClosed(object sender, EventArgs e)
+    {
+        // However the window went away - our Finish, the user's X, or WPF
+        // tearing it down with its owner - stop claiming to be open and give
+        // Playnite back.
+        _win = null;
+        ReleaseOwner();
+    }
+
+    private void OnOwnerClosing(object sender, System.ComponentModel.CancelEventArgs e)
+    {
+        // Playnite is shutting down. Nothing here blocks that; the run just has
+        // to know, or it would carry on writing to a database being torn down.
+        RequestCancel("Playnite is closing, stopping...");
+    }
+
+    private void OnOwnerClosed(object sender, EventArgs e)
+    {
+        Cancelled = true;
+        _win = null;
+        ReleaseOwner();
+    }
+
+    private void RequestCancel(string message)
+    {
+        Cancelled = true;
+        try {
+            if (_cancel != null) { _cancel.IsEnabled = false; }
+            if (_headline != null) { _headline.Text = message; }
+        } catch { }
+    }
+
+    private void ReleaseOwner()
+    {
+        if (!_disabledOwner) { return; }
+        _disabledOwner = false;
+        try {
+            _disableDepth--;
+            if (_disableDepth < 0) { _disableDepth = 0; }
+            if (_owner != null) {
+                _owner.Closing -= OnOwnerClosing;
+                _owner.Closed  -= OnOwnerClosed;
+                if (_disableDepth == 0) { _owner.IsEnabled = true; }
+            }
+        } catch { }
+        _owner = null;
     }
 
     // Playnite themes are just resource dictionaries, so borrow their colours
@@ -2058,11 +2317,26 @@ public class NonSteamShortcutsProgress
         Brush fg = FindBrush("TextBrush");
         if (fg == null) { fg = FindBrush("NormalTextBrush"); }
 
-        if (bg != null) { _win.Background = bg; }
-        if (fg != null) {
-            _headline.Foreground = fg;
-            _detail.Foreground = fg;
-        }
+        if (bg == null) { return; }   // no theme background: leave everything default
+
+        // A theme that names its background but not its text brush would
+        // otherwise give black text on a black window, so pick a readable
+        // colour rather than applying half a theme.
+        if (fg == null) { fg = ContrastingBrush(bg); }
+
+        _win.Background = bg;
+        _headline.Foreground = fg;
+        _detail.Foreground = fg;
+    }
+
+    private Brush ContrastingBrush(Brush background)
+    {
+        var solid = background as SolidColorBrush;
+        if (solid == null) { return Brushes.White; }
+        var c = solid.Color;
+        // Rec. 601 luma, the usual quick test for "is this dark".
+        double luma = (0.299 * c.R + 0.587 * c.G + 0.114 * c.B) / 255.0;
+        return luma < 0.5 ? Brushes.White : Brushes.Black;
     }
 
     private Brush FindBrush(string key)
@@ -2077,7 +2351,7 @@ public class NonSteamShortcutsProgress
     public void Step(string headline, string detail, double value)
     {
         if (_win == null) { return; }
-        if (headline != null) { _headline.Text = headline; }
+        if (headline != null && !Cancelled) { _headline.Text = headline; }
         if (detail != null) { _detail.Text = detail; }
         if (value >= 0) { _bar.Value = value; }
         Pump();
@@ -2115,30 +2389,40 @@ public class NonSteamShortcutsProgress
     /// </summary>
     public void Pump()
     {
-        if (_win == null) { return; }
-        var frame = new DispatcherFrame();
-        _win.Dispatcher.BeginInvoke(
-            DispatcherPriority.Background,
-            new DispatcherOperationCallback(f => { ((DispatcherFrame)f).Continue = false; return null; }),
-            frame);
-        Dispatcher.PushFrame(frame);
+        var win = _win;
+        if (win == null) { return; }
+        // PushFrame pumps the calling thread's dispatcher while the frame-exit
+        // callback is posted to the window's. Off the UI thread those are two
+        // different dispatchers and PushFrame would never return, so do not
+        // pump at all from anywhere but the thread that owns the window.
+        if (!win.Dispatcher.CheckAccess()) { return; }
+        try {
+            var frame = new DispatcherFrame();
+            win.Dispatcher.BeginInvoke(
+                DispatcherPriority.Background,
+                new DispatcherOperationCallback(f => { ((DispatcherFrame)f).Continue = false; return null; }),
+                frame);
+            Dispatcher.PushFrame(frame);
+        } catch {
+            // Dispatcher suspended or shutting down. Losing a repaint is not
+            // worth failing the run that is drawing it.
+        }
     }
 
     public void Finish()
     {
-        // Re-enabling Playnite matters more than closing cleanly, so it goes
-        // first and neither step is allowed to throw.
+        var win = _win;
+        _win = null;
         try {
-            if (_owner != null) { _owner.IsEnabled = _ownerWasEnabled; }
-        } catch { }
-        _owner = null;
-        try {
-            if (_win != null) {
-                _win.Closing -= OnClosing;
-                _win.Close();
+            if (win != null) {
+                win.Closing -= OnClosing;
+                win.Closed  -= OnClosed;
+                win.Close();
             }
         } catch { }
-        _win = null;
+        // Last, and outside that try, because giving Playnite back matters more
+        // than closing tidily.
+        ReleaseOwner();
     }
 }
 '@
@@ -2225,7 +2509,12 @@ function Invoke-ShortcutBuild
     $skippedDuplicate    = New-Object 'System.Collections.Generic.List[string]'
     $urlGames            = New-Object 'System.Collections.Generic.List[string]'
     $gamesToUpdate       = New-Object 'System.Collections.Generic.List[object]'
+    $skippedForeign      = New-Object 'System.Collections.Generic.List[string]'
     $namesThisRun        = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    # Read once: every game consults it, and it is written back by the caller
+    # only after shortcuts.vdf has actually been saved.
+    $owned = Get-OwnedShortcuts
 
     $processed = 0
     foreach ($game in $games) {
@@ -2337,7 +2626,27 @@ function Invoke-ShortcutBuild
         $quotedExe      = '"{0}"' -f $launch.Exe
         $quotedStartDir = '"{0}"' -f $launch.StartDir
 
-        $existing = Find-ShortcutEntry $SteamShortcuts $game.Name
+        # Find our own entry by the identity stamped into it. Matching on the
+        # name would rename-orphan a shortcut, and would quietly overwrite one
+        # that belongs to somebody else.
+        $existing = Find-OwnedShortcutEntry $SteamShortcuts ([string]$game.Id) $owned
+        if (-not $existing) {
+            $byName = Find-ShortcutEntry $SteamShortcuts $game.Name
+            if ($byName) {
+                if ($null -eq (Get-ShortcutOwnerId $byName $owned)) {
+                    # Someone else's shortcut under the same name: EmuDeck,
+                    # Steam ROM Manager, or one made by hand. Overwriting it
+                    # would destroy its command line, and claiming it would let
+                    # a later cleanup delete it as though it were ours.
+                    $__logger.Warn("Non-Steam: '$($game.Name)' is already in Steam and was not created by this extension, leaving it alone")
+                    $skippedForeign.Add($game.Name)
+                    continue
+                }
+                # Ours, but recorded against a different Playnite game. Steam
+                # keys shortcuts by name, so this is still the one to update.
+                $existing = $byName
+            }
+        }
 
         # Reuse whatever app id this shortcut already has. Steam names grid
         # artwork after the appid field, so replacing it with our own would
@@ -2364,6 +2673,42 @@ function Invoke-ShortcutBuild
             'devkitgameid'  = "$($script:OwnerPrefix)$($game.Id)"
         }
 
+        # Artwork is best effort and touches the network and the disk, so it
+        # runs before anything is committed and cannot fail the game. Letting it
+        # throw here would report a game that resolved perfectly well as one
+        # whose launch command could not be worked out.
+        try {
+            $artCopied += Copy-SteamGridArt $GridDir $appId $game -Overwrite:$ReplaceArt
+
+            # Steam falls back to a plain name tile when there is no library
+            # capsule. That is usually because Playnite has no cover for the
+            # game, which is worth saying rather than leaving to be noticed.
+            $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
+            if ($portrait.Count -eq 0 -or $ReplaceArt) {
+                # Playnite had nothing to copy (or we were told to replace), so
+                # try SteamGridDB. Does nothing unless an API key has been set.
+                $artCopied += Copy-SteamGridDbArt $GridDir $appId $game.Name -Overwrite:$ReplaceArt -Progress $Progress
+                $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
+            }
+            if ($portrait.Count -eq 0) {
+                $__logger.Info("Non-Steam: no library artwork for $($game.Name)")
+                $noArtworkGames.Add($game.Name)
+            }
+        } catch {
+            $__logger.Warn("Non-Steam: artwork failed for $($game.Name): $($_.Exception.Message)")
+            $noArtworkGames.Add($game.Name)
+        }
+
+        # Worked out before the commit below, because it reads the existing
+        # entry and must not leave it half-merged if it throws.
+        $tags = Merge-SteamTags $existing $game
+
+        #######################################################################
+        # Commit. Counting the game, putting it in the file and queueing its
+        # Playnite rewrite happen together and nothing between them may throw:
+        # a game in shortcuts.vdf whose play action was never repointed still
+        # launches outside Steam, while being reported as created.
+        #######################################################################
         if ($existing) {
             $gamesUpdated++
             $shortcut = $existing
@@ -2371,40 +2716,30 @@ function Invoke-ShortcutBuild
         } else {
             $gamesNew++
             $shortcut = $fields
+            # Defaults fill in the fields Steam expects, but must not
+            # overwrite the ones just worked out. 'devkitgameid' defaults to
+            # empty, and applying it blindly wiped the ownership stamp off
+            # every newly created shortcut, leaving only the separate json
+            # record to identify our own entries.
             foreach ($k in $script:ShortcutDefaults.Keys) {
-                $shortcut[$k] = $script:ShortcutDefaults[$k]
+                if (-not $shortcut.Contains($k)) {
+                    $shortcut[$k] = $script:ShortcutDefaults[$k]
+                }
             }
             $SteamShortcuts.Add($shortcut)
         }
-
-        $shortcut['tags'] = Merge-SteamTags $shortcut $game
-
-        # Our own record of what we own, which Steam cannot alter.
-        Register-OwnedShortcut $appId ([string]$game.Id)
-
-        $artCopied += Copy-SteamGridArt $GridDir $appId $game -Overwrite:$ReplaceArt
-
-        # Steam falls back to a plain name tile when there is no library
-        # capsule. That is usually because Playnite has no cover for the
-        # game, which is worth saying rather than leaving to be noticed.
-        $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
-        if ($portrait.Count -eq 0 -or $ReplaceArt) {
-            # Playnite had nothing to copy (or we were told to replace), so try
-            # SteamGridDB. Does nothing unless an API key has been set.
-            $artCopied += Copy-SteamGridDbArt $GridDir $appId $game.Name -Overwrite:$ReplaceArt -Progress $Progress
-            $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
-        }
-        if ($portrait.Count -eq 0) {
-            $__logger.Info("Non-Steam: no library artwork for $($game.Name)")
-            $noArtworkGames.Add($game.Name)
-        }
-
-        # Remember the Playnite-side rewrite, applied only once the vdf is saved.
+        $shortcut['tags'] = $tags
         $gamesToUpdate.Add([pscustomobject]@{
             Game         = $game
             SourceAction = $sourceAction
             SteamUrl     = Get-SteamRunGameUrl $appId
         })
+
+        # Our own record of what we own, which Steam cannot alter. Held in
+        # memory and written once the vdf is saved: writing it per game cost a
+        # re-read and re-serialise of the whole file every time, and left the
+        # record claiming shortcuts that a cancelled run never wrote.
+        $owned["$appId"] = [string]$game.Id
 
         }
         catch {
@@ -2427,6 +2762,8 @@ function Invoke-ShortcutBuild
         NoArtworkGames      = $noArtworkGames
         GuessedGames        = $guessedGames
         SkippedDuplicate    = $skippedDuplicate
+        SkippedForeign      = $skippedForeign
+        Owned               = $owned
         UrlGames            = $urlGames
         GamesToUpdate       = $gamesToUpdate
         Shortcuts           = $SteamShortcuts
@@ -2470,6 +2807,14 @@ function Invoke-NonSteamShortcuts
 
     # Load existing shortcuts
     if (Test-Path -LiteralPath $shortcutsVdf -PathType Leaf) {
+        # Ask first, back up second. A backup slot is a scarce resource - only
+        # ten are kept - so taking one before the user has agreed to anything
+        # means changing your mind repeatedly discards the oldest backup, which
+        # is the pristine one from before this extension ever ran.
+        if ($ReplaceAll) {
+            if (-not (Confirm-ReplaceAllShortcuts $shortcutsVdf $games.Count)) { return }
+        }
+
         try {
             $backupPath = Backup-ShortcutsVdf $shortcutsVdf
         } catch {
@@ -2478,7 +2823,6 @@ function Invoke-NonSteamShortcuts
         }
 
         if ($ReplaceAll) {
-            if (-not (Confirm-ReplaceAllShortcuts $shortcutsVdf $games.Count)) { return }
             # Deliberately do NOT read the existing file: the whole point is to
             # discard it and rebuild the list from the selection.
             $steamShortcuts = New-Object 'System.Collections.Generic.List[object]'
@@ -2500,8 +2844,9 @@ function Invoke-NonSteamShortcuts
     # cannot be driven from PowerShell at all; the reasoning is with
     # New-ProgressWindow.
     $progressWindow = New-ProgressWindow -Headline 'Creating non-Steam shortcuts' -Maximum $games.Count
-    $build      = $null
-    $writeError = $null
+    $build        = $null
+    $writeError   = $null
+    $updateFailed = @()
 
     try {
         $build = Invoke-ShortcutBuild `
@@ -2520,7 +2865,22 @@ function Invoke-NonSteamShortcuts
                 $writeError = $_
             }
             if (-not $writeError) {
-                Update-PlayniteGameActions -Items $build.GamesToUpdate -Progress $progressWindow
+                # Only once the file is really on disk. Drop records for app ids
+                # that are no longer in it, so the record cannot accumulate rows
+                # for shortcuts that no longer exist.
+                $live = New-Object 'System.Collections.Generic.HashSet[string]'
+                foreach ($entry in $build.Shortcuts) {
+                    if ($entry.Contains('appid')) {
+                        [void]$live.Add("$(ConvertTo-UnsignedAppId ([long]$entry['appid']))")
+                    }
+                }
+                $keepOwned = @{}
+                foreach ($key in $build.Owned.Keys) {
+                    if ($live.Contains($key)) { $keepOwned[$key] = $build.Owned[$key] }
+                }
+                Save-OwnedShortcuts $keepOwned
+
+                $updateFailed = Update-PlayniteGameActions -Items $build.GamesToUpdate -Progress $progressWindow
             }
         }
     }
@@ -2544,7 +2904,16 @@ function Invoke-NonSteamShortcuts
     }
 
     if ($build.Cancelled) {
+        # Steam is untouched, but artwork already fetched has been written to
+        # the grid folder, so saying "nothing happened" would not be true.
         $__logger.Info('Non-Steam: run cancelled, shortcuts.vdf left untouched')
+        $message  = 'Cancelled. No shortcuts were added to or changed in Steam.' + [Environment]::NewLine + [Environment]::NewLine
+        if ($build.ArtCopied -gt 0) {
+            $message += "$($build.ArtCopied) artwork file(s) had already been written to Steam's grid folder before you cancelled. "
+            $message += 'They are harmless and will be reused if you run this again.' + [Environment]::NewLine + [Environment]::NewLine
+        }
+        $message += 'Run it again to pick up where this left off.'
+        [void]$PlayniteApi.Dialogs.ShowMessage($message, 'Non-Steam Shortcuts')
         return
     }
 
@@ -2553,6 +2922,7 @@ function Invoke-NonSteamShortcuts
         Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
             -SkippedSteamNative $build.SkippedSteamNative -SkippedNoAction $build.SkippedNoAction `
             -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
+            -SkippedForeign $build.SkippedForeign `
             -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
             -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames -NothingWritten
         return
@@ -2561,8 +2931,10 @@ function Invoke-NonSteamShortcuts
     Show-ResultMessage -GamesNew $build.GamesNew -GamesUpdated $build.GamesUpdated -ArtCopied $build.ArtCopied `
         -SkippedSteamNative $build.SkippedSteamNative -SkippedNoAction $build.SkippedNoAction `
         -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
+            -SkippedForeign $build.SkippedForeign `
         -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
-        -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames
+        -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames `
+        -UpdateFailed $updateFailed
 }
 
 function Update-PlayniteGameActions
@@ -2575,8 +2947,15 @@ function Update-PlayniteGameActions
     #>
     param($Items, $Progress)
 
+    $failed = New-Object 'System.Collections.Generic.List[string]'
     $done = 0
-    if ($Progress) { $Progress.SetMaximum($Items.Count) }
+    if ($Progress) {
+        $Progress.SetMaximum($Items.Count)
+        # shortcuts.vdf is already written by this point. Stopping half way
+        # would leave games in Steam that still launch outside it, so this
+        # phase is deliberately not interruptible.
+        $Progress.HideCancel()
+    }
 
     foreach ($item in $Items) {
         $game         = $item.Game
@@ -2635,8 +3014,16 @@ function Update-PlayniteGameActions
             if (-not [object]::ReferenceEquals($action, $steamAction)) { $action.IsPlayAction = $false }
         }
 
-        $PlayniteApi.Database.Games.Update($game)
+        try {
+            $PlayniteApi.Database.Games.Update($game)
+        } catch {
+            # One game that cannot be saved must not abandon the rest, and must
+            # not escape as a raw script error that hides the summary entirely.
+            $__logger.Error("Non-Steam: could not update $($game.Name) in Playnite: $($_.Exception.Message)")
+            $failed.Add($game.Name)
+        }
     }
+    return ,([string[]]$failed.ToArray())
 }
 
 function Show-ResultMessage
@@ -2654,12 +3041,17 @@ function Show-ResultMessage
         $NoArtworkGames,
         $GuessedGames,
         $UrlGames,
+        $SkippedForeign,
+        $UpdateFailed,
         [switch]$NothingWritten
     )
 
+    if ($null -eq $UpdateFailed) { $UpdateFailed = @() }
+    if ($null -eq $SkippedForeign) { $SkippedForeign = @() }
+
     function Format-GameList($list) {
         if ($list.Count -gt 10) {
-            return (($list[0..9] + '[...]') -join [Environment]::NewLine)
+            return (($list[0..9] + "[... and $($list.Count - 10) more, all named in playnite.log]") -join [Environment]::NewLine)
         }
         return ($list -join [Environment]::NewLine)
     }
@@ -2685,6 +3077,18 @@ function Show-ResultMessage
     if ($SkippedDuplicate.Count -gt 0) {
         $message += $nl + $nl + "Skipped $($SkippedDuplicate.Count) game(s) sharing a name with another selected game (Steam identifies shortcuts by name):" + $nl
         $message += Format-GameList $SkippedDuplicate
+        $errors = $true
+    }
+    if ($SkippedForeign.Count -gt 0) {
+        $message += $nl + $nl + "Left $($SkippedForeign.Count) existing Steam shortcut(s) alone, because something else created them and Steam identifies shortcuts by name:" + $nl
+        $message += Format-GameList $SkippedForeign
+        $message += $nl + 'Delete them in Steam first if you want this extension to manage them instead.'
+        $errors = $true
+    }
+    if ($UpdateFailed.Count -gt 0) {
+        $message += $nl + $nl + "$($UpdateFailed.Count) game(s) are in Steam, but Playnite could not save the change that makes them launch through it:" + $nl
+        $message += Format-GameList $UpdateFailed
+        $message += $nl + 'They will still launch directly from Playnite. Run this again to retry.'
         $errors = $true
     }
     if ($SkippedNotInstalled.Count -gt 0) {
