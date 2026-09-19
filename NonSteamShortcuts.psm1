@@ -912,16 +912,21 @@ function Resolve-LibraryPluginLaunch
     }
     if (-not $plugin) { return $null }
 
-    $controllers = $null
+    # GetPlayActions is a C# iterator, so it returns without running anything and
+    # the body only executes on enumeration. Forcing that enumeration here, with
+    # @(), keeps it inside this try: otherwise a plugin that throws while
+    # enumerating - the Epic plugin does exactly this for a game whose manifest
+    # is missing - escapes as an unhandled error and aborts the whole run.
+    $controllers = @()
     try {
         $playArgs = New-Object Playnite.SDK.Plugins.GetPlayActionsArgs
         $playArgs.Game = $Game
-        $controllers = $plugin.GetPlayActions($playArgs)
+        $controllers = @($plugin.GetPlayActions($playArgs))
     } catch {
         $__logger.Error("Non-Steam: $($plugin.Name) could not supply a play action for $($Game.Name): $($_.Exception.Message)")
         return $null
     }
-    if (-not $controllers) { return $null }
+    if ($controllers.Count -eq 0) { return $null }
 
     $result = $null
     $seen   = 0
@@ -1948,6 +1953,10 @@ function Invoke-ShortcutBuild
             continue
         }
 
+        # A plugin can throw from anywhere in here. One unresolvable game must
+        # not take the rest of the selection down with it.
+        try {
+
         $sourceAction = Get-SourcePlayAction $game
 
         if ($sourceAction) {
@@ -2095,6 +2104,13 @@ function Invoke-ShortcutBuild
             SourceAction = $sourceAction
             SteamUrl     = Get-SteamRunGameUrl $appId
         })
+
+        }
+        catch {
+            $__logger.Error("Non-Steam: failed while processing $($game.Name): $($_.Exception.Message)")
+            $skippedUnresolvable.Add($game.Name)
+            continue
+        }
     }
 
 
