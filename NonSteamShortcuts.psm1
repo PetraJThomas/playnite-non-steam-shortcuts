@@ -1291,8 +1291,20 @@ function Set-SteamGridDbApiKey
 
     Save-SteamGridDbApiKey $key
 
-    # Prove the key works now rather than failing silently mid-run.
-    $test = Invoke-SteamGridDbApi "search/autocomplete/$([uri]::EscapeDataString('portal'))" $key
+    # Prove the key works now rather than failing silently mid-run. It is one
+    # network round trip, which is long enough to look like a freeze between
+    # the two dialogs, so say what is happening.
+    $checking = New-ProgressWindow -Headline 'Checking the SteamGridDB key' -Maximum 0
+    try {
+        if ($checking) {
+            $checking.HideCancel()
+            $checking.Say('Asking SteamGridDB whether it accepts the key...')
+        }
+        $test = Invoke-SteamGridDbApi "search/autocomplete/$([uri]::EscapeDataString('portal'))" $key
+    }
+    finally {
+        Close-ProgressWindow $checking
+    }
     if ($null -eq $test) {
         [void]$PlayniteApi.Dialogs.ShowErrorMessage(
             'Saved, but SteamGridDB did not accept that key. Check it and try again.',
@@ -1426,18 +1438,21 @@ function Copy-SteamGridDbArt
         that are still empty unless -Overwrite is given. Returns how many files
         were written.
     #>
-    param([string]$GridDir, [long]$AppId, [string]$Name, [switch]$Overwrite)
+    param([string]$GridDir, [long]$AppId, [string]$Name, [switch]$Overwrite, $Progress)
 
     $key = Get-SteamGridDbApiKey
     if ([string]::IsNullOrWhiteSpace($key)) { return 0 }
 
+    # Each of these is a separate network round trip taking a second or three,
+    # so the caller's window is told about every one of them.
+    if ($Progress) { $Progress.Say("$Name - searching SteamGridDB") }
     $gameId = Find-SteamGridDbGameId $Name $key
     if (-not $gameId) { return 0 }
 
     $wanted = @(
-        @{ Kind = 'grids';  Suffix = 'p';     Query = 'dimensions=600x900' },
-        @{ Kind = 'heroes'; Suffix = '_hero'; Query = '' },
-        @{ Kind = 'logos';  Suffix = '_logo'; Query = '' }
+        @{ Kind = 'grids';  Suffix = 'p';     Query = 'dimensions=600x900'; Label = 'library capsule' },
+        @{ Kind = 'heroes'; Suffix = '_hero'; Query = '';                   Label = 'hero banner' },
+        @{ Kind = 'logos';  Suffix = '_logo'; Query = '';                   Label = 'logo' }
     )
 
     $written = 0
@@ -1445,6 +1460,7 @@ function Copy-SteamGridDbArt
         $existing = @(Get-ChildItem -LiteralPath $GridDir -Filter "$AppId$($slot.Suffix).*" -File -ErrorAction SilentlyContinue)
         if ($existing.Count -gt 0 -and -not $Overwrite) { continue }
 
+        if ($Progress) { $Progress.Say("$Name - downloading $($slot.Label) from SteamGridDB") }
         if (Save-SteamGridDbAsset $GridDir $AppId $gameId $slot.Kind $slot.Suffix $slot.Query $key) {
             $written++
         }
@@ -1790,12 +1806,28 @@ function Sync-NonSteamShortcuts
         return
     }
 
+    # Removing artwork rereads the grid folder per shortcut, so a big cleanup
+    # is slow enough to need telling about.
+    $progressWindow = New-ProgressWindow -Headline 'Removing shortcuts' -Maximum $stale.Count
     $artRemoved = 0
-    foreach ($entry in $stale) {
-        if ($entry.Contains('appid')) {
-            $appId = ConvertTo-UnsignedAppId ([long]$entry['appid'])
-            $artRemoved += Remove-SteamGridArt $gridDir $appId
+    try {
+        $removed = 0
+        foreach ($entry in $stale) {
+            if ($progressWindow) {
+                $progressWindow.Step(
+                    "Removing shortcuts   ($($removed + 1) of $($stale.Count))",
+                    "$($entry['appname']) - deleting its artwork",
+                    $removed)
+            }
+            $removed++
+            if ($entry.Contains('appid')) {
+                $appId = ConvertTo-UnsignedAppId ([long]$entry['appid'])
+                $artRemoved += Remove-SteamGridArt $gridDir $appId
+            }
         }
+    }
+    finally {
+        Close-ProgressWindow $progressWindow
     }
 
     try {
@@ -1897,15 +1929,285 @@ function Reset-NonSteamShortcuts
     Invoke-NonSteamShortcuts $scriptGameMenuItemActionArgs -ReplaceArt -ReplaceAll
 }
 
+###############################################################################
+# Progress window
+#
+# Playnite's own ActivateGlobalProgress cannot be used from a PowerShell
+# extension. It takes Action<T> and Func<T,Task> overloads that a scriptblock
+# matches equally well, so the call is rejected as ambiguous; casting past that
+# only reaches the real problem, which is that Playnite runs the action on a
+# worker thread. A scriptblock has no runspace there, and lending it the
+# calling runspace deadlocks, because that runspace is still busy running the
+# menu action that opened the dialog.
+#
+# So the window below lives on the UI thread with the rest of this script, and
+# the message queue is pumped by hand between games to let it repaint. The
+# whole thing is C#: handing PowerShell scriptblocks to WPF as event handlers
+# runs into the same runspace trouble.
+###############################################################################
+
+$script:ProgressSource = @'
+using System;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Threading;
+
+public class NonSteamShortcutsProgress
+{
+    private Window _win;
+    private Window _owner;
+    private TextBlock _headline;
+    private TextBlock _detail;
+    private ProgressBar _bar;
+    private Button _cancel;
+    private bool _ownerWasEnabled;
+
+    public bool Cancelled;
+    public bool IsOpen { get { return _win != null; } }
+
+    public void Start(string headline, double max, Window owner)
+    {
+        _owner = owner;
+
+        _headline = new TextBlock {
+            Text = headline,
+            FontSize = 15,
+            TextWrapping = TextWrapping.Wrap
+        };
+        _bar = new ProgressBar {
+            Height = 6,
+            Minimum = 0,
+            Maximum = max > 0 ? max : 1,
+            IsIndeterminate = max <= 0,
+            Margin = new Thickness(0, 14, 0, 0)
+        };
+        // Two lines' worth of room, so the window does not jump about as the
+        // running commentary changes length.
+        _detail = new TextBlock {
+            FontSize = 12,
+            Opacity = 0.75,
+            TextWrapping = TextWrapping.Wrap,
+            MinHeight = 32,
+            Margin = new Thickness(0, 10, 0, 0)
+        };
+        _cancel = new Button {
+            Content = "Cancel",
+            Width = 90,
+            Padding = new Thickness(6, 3, 6, 3),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Thickness(0, 12, 0, 0)
+        };
+        _cancel.Click += OnCancel;
+
+        var panel = new StackPanel { Margin = new Thickness(22, 20, 22, 18) };
+        panel.Children.Add(_headline);
+        panel.Children.Add(_bar);
+        panel.Children.Add(_detail);
+        panel.Children.Add(_cancel);
+
+        _win = new Window {
+            Title = "Non-Steam Shortcuts",
+            Content = panel,
+            Width = 540,
+            SizeToContent = SizeToContent.Height,
+            ResizeMode = ResizeMode.NoResize,
+            WindowStyle = WindowStyle.ToolWindow,
+            ShowInTaskbar = false
+        };
+        if (owner != null) {
+            _win.Owner = owner;
+            _win.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        } else {
+            _win.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        }
+        // Closing the window with its X means the same thing as cancelling.
+        _win.Closing += OnClosing;
+
+        ApplyTheme();
+        _win.Show();
+
+        // Keep Playnite itself from taking input while we work, which is what
+        // a modal dialog would do. Our own window stays live so Cancel works.
+        if (_owner != null) {
+            _ownerWasEnabled = _owner.IsEnabled;
+            _owner.IsEnabled = false;
+        }
+        Pump();
+    }
+
+    private void OnCancel(object sender, RoutedEventArgs e)
+    {
+        Cancelled = true;
+        _cancel.IsEnabled = false;
+        _headline.Text = "Stopping after the game in progress...";
+    }
+
+    private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
+    {
+        Cancelled = true;
+    }
+
+    // Playnite themes are just resource dictionaries, so borrow their colours
+    // when they are there and fall back to WPF's defaults when they are not.
+    private void ApplyTheme()
+    {
+        Brush bg = FindBrush("WindowBackgourndBrush");   // Playnite's own spelling
+        if (bg == null) { bg = FindBrush("WindowBackgroundBrush"); }
+        if (bg == null) { bg = FindBrush("ControlBackgroundBrush"); }
+        Brush fg = FindBrush("TextBrush");
+        if (fg == null) { fg = FindBrush("NormalTextBrush"); }
+
+        if (bg != null) { _win.Background = bg; }
+        if (fg != null) {
+            _headline.Foreground = fg;
+            _detail.Foreground = fg;
+        }
+    }
+
+    private Brush FindBrush(string key)
+    {
+        try {
+            if (Application.Current == null) { return null; }
+            return Application.Current.TryFindResource(key) as Brush;
+        } catch { return null; }
+    }
+
+    /// <summary>Headline plus bar position, for moving on to the next item.</summary>
+    public void Step(string headline, string detail, double value)
+    {
+        if (_win == null) { return; }
+        if (headline != null) { _headline.Text = headline; }
+        if (detail != null) { _detail.Text = detail; }
+        if (value >= 0) { _bar.Value = value; }
+        Pump();
+    }
+
+    /// <summary>Just the running commentary, for steps within one item.</summary>
+    public void Say(string detail)
+    {
+        if (_win == null) { return; }
+        if (detail != null) { _detail.Text = detail; }
+        Pump();
+    }
+
+    /// <summary>For work too short to be worth interrupting, where an enabled
+    /// Cancel button would just be a button that does nothing.</summary>
+    public void HideCancel()
+    {
+        if (_win == null) { return; }
+        _cancel.Visibility = Visibility.Collapsed;
+        Pump();
+    }
+
+    public void SetMaximum(double max)
+    {
+        if (_win == null) { return; }
+        _bar.IsIndeterminate = max <= 0;
+        _bar.Maximum = max > 0 ? max : 1;
+        _bar.Value = 0;
+        Pump();
+    }
+
+    /// <summary>
+    /// WPF's DoEvents: drain everything queued above Background priority, which
+    /// includes layout, rendering and the Cancel click, then carry on.
+    /// </summary>
+    public void Pump()
+    {
+        if (_win == null) { return; }
+        var frame = new DispatcherFrame();
+        _win.Dispatcher.BeginInvoke(
+            DispatcherPriority.Background,
+            new DispatcherOperationCallback(f => { ((DispatcherFrame)f).Continue = false; return null; }),
+            frame);
+        Dispatcher.PushFrame(frame);
+    }
+
+    public void Finish()
+    {
+        // Re-enabling Playnite matters more than closing cleanly, so it goes
+        // first and neither step is allowed to throw.
+        try {
+            if (_owner != null) { _owner.IsEnabled = _ownerWasEnabled; }
+        } catch { }
+        _owner = null;
+        try {
+            if (_win != null) {
+                _win.Closing -= OnClosing;
+                _win.Close();
+            }
+        } catch { }
+        _win = null;
+    }
+}
+'@
+
+$script:ProgressTypeState = $null
+
+function Initialize-ProgressWindowType
+{
+    <#
+        Compiling costs a second or so, so it happens on first use rather than
+        at module load, where it would show up as Playnite starting slowly.
+    #>
+    if ($null -ne $script:ProgressTypeState) { return $script:ProgressTypeState }
+    $script:ProgressTypeState = $false
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'NonSteamShortcutsProgress').Type) {
+            Add-Type -TypeDefinition $script:ProgressSource -ReferencedAssemblies @(
+                'PresentationFramework', 'PresentationCore', 'WindowsBase', 'System.Xaml'
+            ) -ErrorAction Stop
+        }
+        $script:ProgressTypeState = $true
+    } catch {
+        $__logger.Warn("Non-Steam: progress window unavailable, continuing without it: $($_.Exception.Message)")
+    }
+    return $script:ProgressTypeState
+}
+
+function New-ProgressWindow
+{
+    <#
+        Returns a progress window, or $null if one cannot be shown. Every caller
+        has to cope with $null anyway, because this also runs under test with no
+        WPF application around it.
+    #>
+    param([string]$Headline, [int]$Maximum)
+
+    if (-not (Initialize-ProgressWindowType)) { return $null }
+    try {
+        $owner = $null
+        if ([System.Windows.Application]::Current) {
+            $owner = [System.Windows.Application]::Current.MainWindow
+        }
+        $window = New-Object NonSteamShortcutsProgress
+        $window.Start($Headline, [double]$Maximum, $owner)
+        return $window
+    } catch {
+        $__logger.Warn("Non-Steam: could not open the progress window: $($_.Exception.Message)")
+        return $null
+    }
+}
+
+function Close-ProgressWindow
+{
+    param($Window)
+    if ($Window) {
+        try { $Window.Finish() } catch { }
+    }
+}
+
 function Invoke-ShortcutBuild
 {
     <#
         Walks the selected games and builds their shortcut entries. Pulled out
-        of Invoke-NonSteamShortcuts so it can run inside Playnite's progress
-        dialog: looking a game up on SteamGridDB is a network round trip, and
-        without this the window just sits there looking hung.
+        of Invoke-NonSteamShortcuts so it can report as it goes: looking a game
+        up on SteamGridDB is a network round trip, and a bulk run over a whole
+        library spends minutes in here.
 
-        $Progress is a GlobalProgressActionArgs, or $null to run without any UI.
+        $Progress is a progress window from New-ProgressWindow, or $null to run
+        without any UI at all.
     #>
     param($Games, [string]$GridDir, $SteamShortcuts, [switch]$ReplaceArt, $Progress)
 
@@ -1929,13 +2231,15 @@ function Invoke-ShortcutBuild
     foreach ($game in $games) {
 
         if ($Progress) {
-            if ($Progress.CancelToken.IsCancellationRequested) {
+            if ($Progress.Cancelled) {
                 $__logger.Info('Non-Steam: cancelled by the user')
                 $cancelled = $true
                 break
             }
-            $Progress.CurrentProgressValue = $processed
-            $Progress.Text = "Reading $($game.Name)  ($($processed + 1) of $($games.Count))"
+            $Progress.Step(
+                "Creating non-Steam shortcuts   ($($processed + 1) of $($games.Count))",
+                "$($game.Name) - working out how to launch it",
+                $processed)
         }
         $processed++
 
@@ -2085,12 +2389,9 @@ function Invoke-ShortcutBuild
         # game, which is worth saying rather than leaving to be noticed.
         $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
         if ($portrait.Count -eq 0 -or $ReplaceArt) {
-            if ($Progress -and -not [string]::IsNullOrWhiteSpace((Get-SteamGridDbApiKey))) {
-                $Progress.Text = "Searching SteamGridDB for $($game.Name)  ($processed of $($games.Count))"
-            }
             # Playnite had nothing to copy (or we were told to replace), so try
             # SteamGridDB. Does nothing unless an API key has been set.
-            $artCopied += Copy-SteamGridDbArt $GridDir $appId $game.Name -Overwrite:$ReplaceArt
+            $artCopied += Copy-SteamGridDbArt $GridDir $appId $game.Name -Overwrite:$ReplaceArt -Progress $Progress
             $portrait = @(Get-ChildItem -LiteralPath $GridDir -Filter "${appId}p.*" -File -ErrorAction SilentlyContinue)
         }
         if ($portrait.Count -eq 0) {
@@ -2195,85 +2496,42 @@ function Invoke-NonSteamShortcuts
         $steamShortcuts = New-Object 'System.Collections.Generic.List[object]'
     }
 
-    # Run the walk inside Playnite's progress dialog. The scriptblock is invoked
-    # on a background thread, so state crosses the boundary through $script:
-    # variables rather than a closure.
-    $script:BuildInput  = @{
-        Games      = $games
-        GridDir    = $gridDir
-        Shortcuts  = $steamShortcuts
-        ReplaceArt = [bool]$ReplaceArt
-    }
-    $script:BuildResult = $null
-    $script:BuildError  = $null
+    # Our own progress window, on this thread. Playnite's ActivateGlobalProgress
+    # cannot be driven from PowerShell at all; the reasoning is with
+    # New-ProgressWindow.
+    $progressWindow = New-ProgressWindow -Headline 'Creating non-Steam shortcuts' -Maximum $games.Count
+    $build      = $null
+    $writeError = $null
 
     try {
-        $options = New-Object Playnite.SDK.GlobalProgressOptions('Creating non-Steam shortcuts...', $true)
-        $options.IsIndeterminate = $false
-        [void]$PlayniteApi.Dialogs.ActivateGlobalProgress({
-                param($progress)
-                $progress.ProgressMaxValue = $script:BuildInput.Games.Count
-                try {
-                    $script:BuildResult = Invoke-ShortcutBuild `
-                        -Games      $script:BuildInput.Games `
-                        -GridDir    $script:BuildInput.GridDir `
-                        -SteamShortcuts $script:BuildInput.Shortcuts `
-                        -ReplaceArt:$script:BuildInput.ReplaceArt `
-                        -Progress   $progress
-                } catch {
-                    $script:BuildError = $_
-                }
-            }, $options)
-    } catch {
-        $script:BuildError = $_
+        $build = Invoke-ShortcutBuild `
+            -Games $games -GridDir $gridDir -SteamShortcuts $steamShortcuts `
+            -ReplaceArt:$ReplaceArt -Progress $progressWindow
+
+        # A cancelled run leaves shortcuts.vdf alone, so there is nothing to
+        # save and nothing to undo.
+        if (-not $build.Cancelled -and $build.GamesToUpdate.Count -gt 0) {
+            if ($progressWindow) {
+                $progressWindow.Step('Saving', 'Writing shortcuts.vdf...', $games.Count)
+            }
+            try {
+                Write-ShortcutsVdf $shortcutsVdf $build.Shortcuts
+            } catch {
+                $writeError = $_
+            }
+            if (-not $writeError) {
+                Update-PlayniteGameActions -Items $build.GamesToUpdate -Progress $progressWindow
+            }
+        }
+    }
+    finally {
+        # Before any dialog: the window disables Playnite's main window while it
+        # is up, and leaving it open behind a message box would look stuck.
+        Close-ProgressWindow $progressWindow
     }
 
-    if ($script:BuildError) {
-        $__logger.Error("Non-Steam: progress dialog failed, continuing without it: $($script:BuildError.Exception.Message)")
-    }
-    if ($null -eq $script:BuildResult) {
-        # Either the dialog could not run the action or it failed. Do the work
-        # anyway rather than silently doing nothing; the window will block.
-        $__logger.Warn('Non-Steam: running without the progress dialog')
-        $script:BuildResult = Invoke-ShortcutBuild `
-            -Games $games -GridDir $gridDir -SteamShortcuts $steamShortcuts -ReplaceArt:$ReplaceArt -Progress $null
-    }
-
-    $build = $script:BuildResult
-    if ($build.Cancelled) {
-        $__logger.Info('Non-Steam: run cancelled, shortcuts.vdf left untouched')
-        return
-    }
-
-    $gamesNew            = $build.GamesNew
-    $gamesUpdated        = $build.GamesUpdated
-    $artCopied           = $build.ArtCopied
-    $skippedNoAction     = $build.SkippedNoAction
-    $skippedSteamNative  = $build.SkippedSteamNative
-    $skippedUnresolvable = $build.SkippedUnresolvable
-    $skippedNotInstalled = $build.SkippedNotInstalled
-    $noOverlayGames      = $build.NoOverlayGames
-    $noArtworkGames      = $build.NoArtworkGames
-    $guessedGames        = $build.GuessedGames
-    $skippedDuplicate    = $build.SkippedDuplicate
-    $urlGames            = $build.UrlGames
-    $gamesToUpdate       = $build.GamesToUpdate
-    $steamShortcuts      = $build.Shortcuts
-
-    if ($gamesToUpdate.Count -eq 0) {
-        # Nothing resolved, so do not rewrite a file we have no changes for.
-        Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
-            -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
-            -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -GuessedGames $guessedGames -UrlGames $urlGames -NothingWritten
-        return
-    }
-
-    # Save shortcuts.vdf
-    try {
-        Write-ShortcutsVdf $shortcutsVdf $steamShortcuts
-    } catch {
-        [void]$PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.ToString(), 'Error saving shortcuts.vdf')
+    if ($writeError) {
+        [void]$PlayniteApi.Dialogs.ShowErrorMessage($writeError.Exception.ToString(), 'Error saving shortcuts.vdf')
         if ($backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
             try {
                 Copy-Item -LiteralPath $backupPath -Destination $shortcutsVdf -Force -ErrorAction Stop
@@ -2285,10 +2543,52 @@ function Invoke-NonSteamShortcuts
         return
     }
 
-    # Rewrite the Playnite actions so the game launches through Steam
-    foreach ($item in $gamesToUpdate) {
+    if ($build.Cancelled) {
+        $__logger.Info('Non-Steam: run cancelled, shortcuts.vdf left untouched')
+        return
+    }
+
+    if ($build.GamesToUpdate.Count -eq 0) {
+        # Nothing resolved, so nothing was written.
+        Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
+            -SkippedSteamNative $build.SkippedSteamNative -SkippedNoAction $build.SkippedNoAction `
+            -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
+            -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
+            -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames -NothingWritten
+        return
+    }
+
+    Show-ResultMessage -GamesNew $build.GamesNew -GamesUpdated $build.GamesUpdated -ArtCopied $build.ArtCopied `
+        -SkippedSteamNative $build.SkippedSteamNative -SkippedNoAction $build.SkippedNoAction `
+        -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
+        -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
+        -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames
+}
+
+function Update-PlayniteGameActions
+{
+    <#
+        Point each game's play action at Steam, now that shortcuts.vdf holds the
+        matching entries. Separate from the build so the progress window can
+        keep moving through what is, for a whole library, hundreds of database
+        writes.
+    #>
+    param($Items, $Progress)
+
+    $done = 0
+    if ($Progress) { $Progress.SetMaximum($Items.Count) }
+
+    foreach ($item in $Items) {
         $game         = $item.Game
         $sourceAction = $item.SourceAction
+
+        if ($Progress) {
+            $Progress.Step(
+                "Updating Playnite   ($($done + 1) of $($Items.Count))",
+                "$($game.Name) - pointing its play action at Steam",
+                $done)
+        }
+        $done++
 
         # A library-plugin game may have no GameActions collection at all.
         if (-not $game.GameActions) {
@@ -2337,11 +2637,6 @@ function Invoke-NonSteamShortcuts
 
         $PlayniteApi.Database.Games.Update($game)
     }
-
-    Show-ResultMessage -GamesNew $gamesNew -GamesUpdated $gamesUpdated -ArtCopied $artCopied `
-        -SkippedSteamNative $skippedSteamNative -SkippedNoAction $skippedNoAction `
-        -SkippedUnresolvable $skippedUnresolvable -SkippedDuplicate $skippedDuplicate `
-            -SkippedNotInstalled $skippedNotInstalled -NoOverlayGames $noOverlayGames -NoArtworkGames $noArtworkGames -GuessedGames $guessedGames -UrlGames $urlGames
 }
 
 function Show-ResultMessage
