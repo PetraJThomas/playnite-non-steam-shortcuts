@@ -802,7 +802,15 @@ function Get-SourcePlayAction
     foreach ($action in $candidates) {
         if ($action.Name -eq $script:LaunchWithoutSteamName) { return $action }
     }
-    return $candidates[0]
+
+    # Nothing here says how the game launches. Falling back to whatever happens
+    # to be first would hand the shortcut a "Configure" or "Open save folder"
+    # action the user added in Playnite, and because finding any action at all
+    # stops the library plugin from being asked, the plugin's real launch
+    # command would never be consulted. Better to answer "no idea" and let the
+    # caller move on to the plugin and the install folder.
+    $__logger.Info("Non-Steam: no play action on $($Game.Name), leaving it to the library plugin")
+    return $null
 }
 
 # Executables that are never the game, and folders that only ever hold
@@ -1343,21 +1351,47 @@ function Get-SteamGridDbApiKey
         if (-not [string]::IsNullOrWhiteSpace($encoded)) {
             $script:SgdbKey = Unprotect-SteamGridDbKey $encoded
         }
-        return $script:SgdbKey
+        # Deliberately no early return: a plaintext key from before encryption
+        # has to be cleared away even once an encrypted one exists. The old
+        # code only looked when the encrypted file was missing, so a delete
+        # that failed the first time - a lock, a read-only flag, a restored
+        # backup - left the key readable on disk for good, which is the one
+        # thing the encryption is there to prevent.
     }
 
-    # Migrate a plaintext key written by an earlier version, then shred it.
-    $legacy = Get-SteamGridDbLegacyKeyPath
-    if (Test-Path -LiteralPath $legacy -PathType Leaf) {
-        $key = (Get-Content -LiteralPath $legacy -Raw -ErrorAction SilentlyContinue)
-        if ($key) { $key = $key.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($key)) {
-            Save-SteamGridDbApiKey $key
-            $__logger.Info('Non-Steam: migrated the SteamGridDB key to encrypted storage')
-        }
-        Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
-    }
+    Clear-SteamGridDbLegacyKey
     return $script:SgdbKey
+}
+
+function Clear-SteamGridDbLegacyKey
+{
+    <#
+        Take over a plaintext key written by an earlier version, then delete
+        it. Runs on every load, not just the first, because the delete can
+        fail and a key left in the clear is worth retrying.
+    #>
+    $legacy = Get-SteamGridDbLegacyKeyPath
+    if (-not (Test-Path -LiteralPath $legacy -PathType Leaf)) { return }
+
+    $key = (Get-Content -LiteralPath $legacy -Raw -ErrorAction SilentlyContinue)
+    if ($key) { $key = $key.Trim() }
+
+    # Only adopt it if there is nothing encrypted yet; otherwise the encrypted
+    # one wins and this file is simply stale.
+    if (-not [string]::IsNullOrWhiteSpace($key) -and [string]::IsNullOrWhiteSpace($script:SgdbKey)) {
+        Save-SteamGridDbApiKey $key
+        $__logger.Info('Non-Steam: migrated the SteamGridDB key to encrypted storage')
+    }
+
+    try {
+        # Overwrite before unlinking, so the key is not left recoverable in the
+        # file's old blocks.
+        [System.IO.File]::WriteAllText($legacy, (' ' * 64))
+        Remove-Item -LiteralPath $legacy -Force -ErrorAction Stop
+        $__logger.Info('Non-Steam: removed the old plaintext SteamGridDB key file')
+    } catch {
+        $__logger.Warn("Non-Steam: a plaintext SteamGridDB key is still on disk at $legacy and could not be removed: $($_.Exception.Message)")
+    }
 }
 
 function Set-SteamGridDbApiKey
@@ -2537,6 +2571,7 @@ function Invoke-ShortcutBuild
     $urlGames            = New-Object 'System.Collections.Generic.List[string]'
     $gamesToUpdate       = New-Object 'System.Collections.Generic.List[object]'
     $skippedForeign      = New-Object 'System.Collections.Generic.List[string]'
+    $unreadableTargets   = New-Object 'System.Collections.Generic.List[string]'
     $namesThisRun        = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
     # Read once: every game consults it, and it is written back by the caller
@@ -2628,7 +2663,11 @@ function Invoke-ShortcutBuild
                 }
                 # Marked installed but unreadable: could be ACLs or a drive that
                 # is offline rather than a genuinely bad path, so warn and go on.
+                # Reported as well as logged: the shortcut may well be
+                # dead, and the user is the only one who can tell whether the
+                # drive is merely offline.
                 $__logger.Warn("Non-Steam: launch path is not readable for $($game.Name), creating the shortcut anyway: $($launch.Exe)")
+                $unreadableTargets.Add($game.Name)
             }
         }
 
@@ -2793,6 +2832,7 @@ function Invoke-ShortcutBuild
         GuessedGames        = $guessedGames
         SkippedDuplicate    = $skippedDuplicate
         SkippedForeign      = $skippedForeign
+        UnreadableTargets   = $unreadableTargets
         Owned               = $owned
         UrlGames            = $urlGames
         GamesToUpdate       = $gamesToUpdate
@@ -2952,7 +2992,7 @@ function Invoke-NonSteamShortcuts
         Show-ResultMessage -GamesNew 0 -GamesUpdated 0 -ArtCopied 0 `
             -SkippedSteamNative $build.SkippedSteamNative -SkippedNoAction $build.SkippedNoAction `
             -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
-            -SkippedForeign $build.SkippedForeign `
+            -SkippedForeign $build.SkippedForeign -UnreadableTargets $build.UnreadableTargets `
             -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
             -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames -PlayniteArtOnly:$PlayniteArtOnly -NothingWritten
         return
@@ -2961,7 +3001,7 @@ function Invoke-NonSteamShortcuts
     Show-ResultMessage -GamesNew $build.GamesNew -GamesUpdated $build.GamesUpdated -ArtCopied $build.ArtCopied `
         -SkippedSteamNative $build.SkippedSteamNative -SkippedNoAction $build.SkippedNoAction `
         -SkippedUnresolvable $build.SkippedUnresolvable -SkippedDuplicate $build.SkippedDuplicate `
-            -SkippedForeign $build.SkippedForeign `
+            -SkippedForeign $build.SkippedForeign -UnreadableTargets $build.UnreadableTargets `
         -SkippedNotInstalled $build.SkippedNotInstalled -NoOverlayGames $build.NoOverlayGames `
         -NoArtworkGames $build.NoArtworkGames -GuessedGames $build.GuessedGames -UrlGames $build.UrlGames -PlayniteArtOnly:$PlayniteArtOnly `
         -UpdateFailed $updateFailed
@@ -3072,6 +3112,7 @@ function Show-ResultMessage
         $GuessedGames,
         $UrlGames,
         $SkippedForeign,
+        $UnreadableTargets,
         $UpdateFailed,
         [switch]$PlayniteArtOnly,
         [switch]$NothingWritten
@@ -3079,6 +3120,7 @@ function Show-ResultMessage
 
     if ($null -eq $UpdateFailed) { $UpdateFailed = @() }
     if ($null -eq $SkippedForeign) { $SkippedForeign = @() }
+    if ($null -eq $UnreadableTargets) { $UnreadableTargets = @() }
 
     function Format-GameList($list) {
         if ($list.Count -gt 10) {
@@ -3114,6 +3156,12 @@ function Show-ResultMessage
         $message += $nl + $nl + "Left $($SkippedForeign.Count) existing Steam shortcut(s) alone, because something else created them and Steam identifies shortcuts by name:" + $nl
         $message += Format-GameList $SkippedForeign
         $message += $nl + 'Delete them in Steam first if you want this extension to manage them instead.'
+        $errors = $true
+    }
+    if ($UnreadableTargets.Count -gt 0) {
+        $message += $nl + $nl + "$($UnreadableTargets.Count) game(s) are marked installed but their file could not be read, so the shortcut may not launch:" + $nl
+        $message += Format-GameList $UnreadableTargets
+        $message += $nl + 'That is expected if they live on a drive that is currently offline. Otherwise check them in Playnite.'
         $errors = $true
     }
     if ($UpdateFailed.Count -gt 0) {

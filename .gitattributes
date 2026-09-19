@@ -1,0 +1,5 @@
+# Keep repository furniture out of the .pext. Playnite unpacks the archive
+# straight into an extension folder, so anything shipped is installed.
+.github        export-ignore
+.gitattributes export-ignore
+legacy         export-ignore

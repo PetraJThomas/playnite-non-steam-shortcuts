@@ -54,7 +54,7 @@ The Playnite 9 data model changes it had to absorb:
 To confirm it loaded, check `playnite.log` for:
 
 ```
-Loaded script extension: ...\NonSteamShortcuts.psm1, version 0.3.0
+Loaded script extension: ...\NonSteamShortcuts.psm1, version 1.0.0
 ```
 
 There is nothing to edit by hand — unlike the original, no paths are hardcoded.
@@ -92,9 +92,10 @@ Select one or more games in Playnite, right-click, then **Non-Steam Shortcuts**:
 
 | Menu entry | What it does |
 | ---------- | ------------ |
-| **Create non-Steam shortcuts** | Creates or updates the shortcuts. Fills any artwork slot that is currently empty, leaving existing Steam artwork alone. |
-| **Create non-Steam shortcuts (replace Steam artwork)** | The same, but always refreshes the Steam-side artwork from Playnite and SteamGridDB. |
+| **Create non-Steam shortcuts** | Creates or updates the shortcuts. Fills any artwork slot that is currently empty, leaving existing Steam artwork alone. Falls back to SteamGridDB for anything Playnite has no cover for. |
+| **Create non-Steam shortcuts (use Playnite artwork, replacing Steam's)** | The same, but the artwork comes from Playnite and only Playnite, overwriting what Steam has. SteamGridDB is not consulted at all. See [when to use this](#overruling-a-bad-steamgriddb-match). |
 | **Replace ALL non-Steam shortcuts with the selected games** | Destructive. See [Keeping Steam in sync](#keeping-steam-in-sync). |
+| **Replace ALL non-Steam shortcuts with the selected games (use Playnite artwork)** | The destructive rebuild, with artwork from Playnite only. |
 
 Under **Extensions → Non-Steam Shortcuts** (the main menu) there are three more:
 
@@ -105,11 +106,22 @@ Under **Extensions → Non-Steam Shortcuts** (the main menu) there are three mor
 | **Remove shortcuts for games deleted from Playnite** | Tidies up shortcuts whose game is gone. |
 
 A progress window shows which game is being handled and how far through the
-selection it is, and can be cancelled. Cancelling stops before anything is
-written, so `shortcuts.vdf` is left exactly as it was.
+selection it is, and can be cancelled. Cancelling leaves `shortcuts.vdf` exactly
+as it was — nothing is written to Steam's shortcut list unless the whole run
+finishes. Artwork already downloaded before you cancelled does stay in the grid
+folder; it is harmless, and reused if you run again. The summary says so.
 
 When it finishes you get a summary of what was created, updated, skipped, and
 why. Start Steam again to see the results.
+
+### Shortcuts made by something else
+
+Steam identifies a non-Steam shortcut by its name, so a game in Playnite can
+collide with a shortcut created by EmuDeck, Steam ROM Manager or by hand. The
+extension stamps every shortcut it creates and only ever updates its own, so a
+colliding shortcut that belongs to something else is left untouched and listed
+in the summary. If you would rather this extension managed it, delete it in
+Steam first and run again.
 
 ### What happens to the Playnite entry
 
@@ -186,9 +198,10 @@ hero, and the logo.
 
 1.  Get a free key at <https://www.steamgriddb.com/profile/preferences/api>.
 2.  **Extensions → Non-Steam Shortcuts → Set SteamGridDB API key...** and paste
-    it. The key is checked against the API as you save, so a bad one is caught
-    immediately.
-3.  Run **"replace Steam artwork"** on the games that were missing art.
+    it. The key is checked against the API before it is kept, so a rejected key
+    is reported and not saved, rather than failing silently on every later run.
+3.  Run **"Create non-Steam shortcuts"** again on the games that were missing
+    art.
 
 Clear the field to turn the fallback off again.
 
@@ -198,10 +211,23 @@ useless if copied elsewhere. It is not a vault: anything already running as you
 can ask DPAPI to decrypt it just as the extension does. The point is that the key
 is not sitting in a text file to be read over your shoulder, synced or backed up.
 
-Playnite's own art always wins — SteamGridDB is only consulted for slots that are
-still empty, unless you use "replace Steam artwork". Matching is by game name, so
-an unusual name can match the wrong title or nothing at all; `playnite.log`
-records what each name matched.
+Playnite's own art always wins — SteamGridDB is only consulted for slots that
+are still empty. Matching is by game name, so an unusual name can match the
+wrong title or nothing at all; `playnite.log` records what each name matched.
+
+### Overruling a bad SteamGridDB match
+
+SteamGridDB searches on the game's name, and sometimes it is confidently wrong:
+in testing it answered *Farm Frenzy 3: Ice Age* for a game called *Ice Age
+3(TM)*. Because the search is the thing that went wrong, "try again" does not
+help.
+
+The fix is to curate the artwork where you can see it. Edit the game in
+Playnite, give it the cover and background you actually want, then run **"use
+Playnite artwork"** — either the create or the replace-all variant. Those two
+never ask SteamGridDB anything, so whatever is in Playnite is exactly what ends
+up in Steam. A game with no cover in Playnite is reported as having no artwork
+rather than quietly falling back.
 
 Nothing is invented. With no key set, or when SteamGridDB has nothing, Steam
 keeps its own plain name tile, and the summary lists every game that ended up
@@ -211,8 +237,11 @@ bare so you always know which ones they are.
 
 *   **Games must be installed** — genuinely, not just marked as such. A shortcut
     is a path to an executable, so there is nothing to point at until then. The
-    target is verified before anything is written, so an uninstalled game with a
-    stale action cannot produce a dead shortcut.
+    target is checked before anything is written: a game that is not installed
+    and whose launch path is gone is skipped outright. A game Playnite still
+    calls installed but whose file cannot be read gets its shortcut anyway —
+    that is usually a drive that is merely offline — and is listed in the
+    summary so you can check it.
 
     Stores lie about this more than you would expect. Ubisoft Connect leaves a
     registry entry and a `uplay_install.state` file behind after a game is
@@ -265,14 +294,29 @@ bare so you always know which ones they are.
 ## Safety
 
 *   `shortcuts.vdf` is backed up before every run to a timestamped
-    `shortcuts.vdf.<yyyyMMdd-HHmmss>.bak`, keeping the ten most recent.
-*   It is written to a temporary file and swapped in, so a failure cannot leave a
-    truncated file behind. If the write fails, the backup is restored.
+    `shortcuts.vdf.<stamp>.bak`, keeping the ten most recent **plus the very
+    first one, permanently**. That first backup is the only copy of the file as
+    it was before this extension ever touched it, which is exactly what you need
+    to undo a "replace ALL".
+*   The backup is taken after you confirm a destructive action, not before, so
+    opening a confirmation dialog and changing your mind costs nothing.
+*   It is written to a temporary file, flushed to disk and swapped in, so a
+    failure cannot leave a truncated file behind. If the write fails, the backup
+    is restored — on the cleanup path as well as the main one.
+*   Only shortcuts this extension created are ever modified or removed. Every
+    one it writes is stamped, and that stamp is backed by a separate record in
+    the extension's data folder, so a shortcut belonging to EmuDeck, Steam ROM
+    Manager or to you by hand is left alone even when it shares a game's name.
 *   Entries are kept in file order rather than re-keyed by name, so shortcuts
-    with duplicate or empty names — common with EmuDeck and Steam ROM Manager —
-    are preserved rather than dropped.
+    with duplicate or empty names — common with EmuDeck and Steam ROM Manager
+    — are preserved rather than dropped.
 *   An existing shortcut keeps its stored `appid`, because Steam names grid
     artwork after that field. Replacing it would orphan the art already on disk.
+    Renaming a game in Playnite therefore updates its existing shortcut rather
+    than leaving a stale duplicate behind.
+*   Artwork is downloaded to a temporary file and moved into place only once it
+    has arrived, so a dropped connection cannot destroy the art it was about to
+    replace.
 
 ## Troubleshooting
 
@@ -281,7 +325,7 @@ bare so you always know which ones they are.
 | Menu entries missing | The extension did not load. Check `playnite.log` for `Loaded script extension`, and that `extension.yaml` is at the folder's top level. |
 | Shortcuts vanish after closing Steam | Steam was running during the write. Close Steam, run it again. |
 | "No Steam user profile was found" | The folder picked has no `userdata\<id>` inside it. Pick the Steam install folder or a profile folder. |
-| Plain grey tiles in Steam | No artwork in Playnite and none on SteamGridDB. Give the game a cover in Playnite, then "replace Steam artwork". |
+| Plain grey tiles in Steam | No artwork in Playnite and none on SteamGridDB. Give the game a cover in Playnite, then run "use Playnite artwork". |
 | Game skipped as "not installed" | Install it first — there is no executable to point at yet. |
 
 `playnite.log` records a line for every decision, including what each library
