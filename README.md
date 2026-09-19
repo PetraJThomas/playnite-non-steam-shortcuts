@@ -331,6 +331,26 @@ bare so you always know which ones they are.
 `playnite.log` records a line for every decision, including what each library
 plugin returned and what SteamGridDB matched.
 
+## Running the tests
+
+`tests/` holds a regression suite. Each file pins a defect that actually
+happened, so they are worth keeping green.
+
+```
+C:\Windows\SysWOW64\WindowsPowerShell1.0\powershell.exe -STA -ExecutionPolicy Bypass -File testsun-all.ps1
+```
+
+It has to be **x86** PowerShell, because `Playnite.SDK.dll` is x86, and `-STA`
+because some tests create real WPF windows. The runner refuses to start under
+the wrong one rather than failing obscurely.
+
+Tests that need local state — a Steam install, a game folder, a Microsoft Store
+package — discover it and report `SKIP` when it is not there, so the suite is
+still meaningful on a machine that has none of it. `NONSTEAM_PLAYNITE_SDK` and
+`NONSTEAM_TEST_GAMEDIR` override the SDK and game-folder locations.
+
+The tests are `export-ignore`d, so they are not part of the `.pext`.
+
 ## Sources used for shortcut.vdf reverse engineering
 
 *   <https://github.com/tirish/steam-shortcut-editor/blob/master/lib/parser.js>

@@ -3,3 +3,4 @@
 .github        export-ignore
 .gitattributes export-ignore
 legacy         export-ignore
+tests          export-ignore
